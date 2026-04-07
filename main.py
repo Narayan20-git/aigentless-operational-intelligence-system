@@ -6,7 +6,6 @@ from fastapi.responses import RedirectResponse
 from fastapi_standalone_docs import StandaloneDocs
 
 from config.database import close_db, startup_database
-from routes.lead_routes import router as lead_router
 from routes.property_routes import router as property_router
 
 
@@ -27,7 +26,6 @@ app.add_middleware(
 )
 StandaloneDocs(app=app)
 app.include_router(property_router, prefix="/properties", tags=["Properties"])
-app.include_router(lead_router, prefix="/leads", tags=["Leads"])
 
 
 @app.get("/", include_in_schema=False)

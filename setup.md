@@ -1,242 +1,150 @@
 # Local development setup
 
-This guide helps a new developer run **aigentless-operational-intelligence-system** on their machine: Python environment, MongoDB, environment variables, and the FastAPI server.
+Brief steps to go from **clone** to **running** **aigentless-operational-intelligence-system** (FastAPI + Supabase).
 
 ---
 
-## 1. What you need installed
+## Quick path (clone → run)
+
+1. **Install:** Python **3.11+**, **Git**.
+2. **Clone** the repo and enter the folder:
+
+   ```powershell
+   git clone https://github.com/Narayan20-git/aigentless-operational-intelligence-system.git
+   cd aigentless-operational-intelligence-system
+   ```
+
+3. **Virtual environment** (Windows PowerShell):
+
+   ```powershell
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   ```
+
+   If activation fails (execution policy):
+
+   ```powershell
+   Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+   ```
+
+4. **Dependencies:**
+
+   ```powershell
+   pip install --upgrade pip
+   pip install -r requirements.txt
+   ```
+
+5. **Environment variables:** copy `.env.example` to `.env` in the project root and set these three (same names as in Supabase **Settings → API**):
+
+   | Variable | Notes |
+   |----------|--------|
+   | `SUPABASE_URL` | Project URL. |
+   | `SUPABASE_KEY` | **anon / public** key (used if service role is empty). |
+   | `SUPABASE_SERVICE_ROLE_KEY` | **Service role** key for backend use; takes precedence over `SUPABASE_KEY` when set. Keep secret. |
+
+   The app resolves the API key in this order: `SUPABASE_SERVICE_ROLE_KEY` → `SUPABASE_KEY` → `SUPABASE_ANON_KEY` (optional alias). It pings the **`properties`** table on startup; ensure that table exists and RLS/policies match the key you use.
+
+6. **Start the API:**
+
+   ```powershell
+   python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
+   ```
+
+7. **Open:** [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs) (Swagger). Root `/` redirects to `/docs`.
+
+---
+
+## Prerequisites (detail)
 
 | Requirement | Notes |
 |-------------|--------|
-| **Python 3.11+** | 3.12 is fine. Check: `python --version` |
-| **Git** | To clone the repository |
-| **Docker Desktop** (optional) | Only if you want MongoDB in a container instead of Atlas/local install |
+| **Python 3.11+** | Check: `python --version` |
+| **Git** | For cloning |
+| **Supabase project** | URL + API key(s) as above |
 
 ---
 
-## 2. Clone the repository
+## macOS / Linux
 
-```powershell
-git clone <repository-url>
+```bash
+git clone https://github.com/Narayan20-git/aigentless-operational-intelligence-system.git
 cd aigentless-operational-intelligence-system
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+# create .env from .env.example, then:
+uvicorn main:app --reload --host 127.0.0.1 --port 8000
 ```
 
 ---
 
-## 3. Create a virtual environment
-
-From the project root:
-
-**Windows (PowerShell)**
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
-
-If activation fails with a script policy error:
-
-```powershell
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
-```
-
-**Without activating** (works the same for commands):
+## Without activating the venv
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-```
-
-**macOS / Linux**
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
----
-
-## 4. Install Python dependencies
-
-With the venv activated:
-
-```powershell
-pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-Main stack: **FastAPI**, **Uvicorn**, **Beanie**, **PyMongo** (async), **Motor** (listed for compatibility), **python-dotenv**, **Pydantic v2**, **certifi**, **fastapi-standalone-docs** (Swagger without CDN).
-
----
-
-## 5. Environment variables (`.env`)
-
-1. In the **project root**, create a file named **`.env`** (it is **gitignored** — do not commit secrets).
-2. Add at least:
-
-```env
-MONGO_URL=mongodb://127.0.0.1:27017
-DB_NAME=aigentless
-```
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `MONGO_URL` | Recommended | MongoDB connection string. Defaults in code to `mongodb://localhost:27017` if unset. |
-| `DB_NAME` | Recommended | Database name. Defaults to `aigentless`. |
-
-### Optional — MongoDB Atlas or strict TLS
-
-| Variable | When to use |
-|----------|-------------|
-| `MONGO_TLS_RELAXED=true` | Atlas TLS fails on corporate VPN / Windows (dev only). |
-| `MONGO_TLS_ALLOW_INVALID_CERTS=true` | Relax certificate validation (avoid combining with conflicting URI options). |
-| `MONGO_TLS_DISABLE_OCSP=true` | OCSP checks blocked on your network. |
-| `MONGO_SERVER_SELECTION_TIMEOUT_MS` | Default `10000`. Increase if slow networks. |
-| `DB_OPTIONAL_STARTUP=true` | If Mongo is down, the API still starts; `/leads/*` returns **503** until DB works. |
-
-### Example — MongoDB Atlas
-
-```env
-MONGO_URL=mongodb+srv://USER:PASSWORD@CLUSTER.mongodb.net/?retryWrites=true&w=majority
-DB_NAME=aigentless
-```
-
-Ensure **Atlas → Network Access** allows your IP.
-
----
-
-## 6. Run MongoDB
-
-Pick **one** of these.
-
-### Option A — Docker (simplest for local dev)
-
-From the project root:
-
-```powershell
-docker compose up -d mongo
-```
-
-This starts **MongoDB 6** on **`localhost:27017`**. Use:
-
-```env
-MONGO_URL=mongodb://127.0.0.1:27017
-DB_NAME=aigentless
-```
-
-### Option B — MongoDB installed on the OS
-
-Install MongoDB Community Server, start the service, and keep `MONGO_URL` pointing at `mongodb://127.0.0.1:27017` (or your port).
-
-### Option C — MongoDB Atlas only
-
-Set `MONGO_URL` to your Atlas SRV string and `DB_NAME` as in Atlas. If TLS errors appear on your network, see optional env vars above or use **Option A** for local development.
-
----
-
-## 7. Seed sample data (optional)
-
-With MongoDB running and `.env` configured:
-
-```powershell
-python scripts/seed_leads.py
-```
-
-You should see a success message about **5** leads inserted into the **`leads`** collection.
-
----
-
-## 8. Start the API server
-
-From the project root, with venv activated:
-
-```powershell
-python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
-```
-
-Or:
-
-```powershell
 .\.venv\Scripts\python.exe -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-- **Swagger UI:** [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)  
-- **ReDoc:** [http://127.0.0.1:8000/redoc](http://127.0.0.1:8000/redoc)  
-- **OpenAPI JSON:** [http://127.0.0.1:8000/openapi.json](http://127.0.0.1:8000/openapi.json)
+---
 
-### Useful endpoints to verify
+## Stack (reference)
 
-| Endpoint | Purpose |
-|----------|---------|
-| `GET /leads/summary` | UI-ready lead counts + card payload |
-| `GET /leads/` | All leads |
-| `GET /leads/?status=Hot` | Filter by status |
-| `POST /leads/` | Create a lead |
-| `GET /properties/` | Properties (stub service) |
+- **FastAPI**, **Uvicorn**, **Pydantic v2**, **python-dotenv**, **fastapi-standalone-docs** (Swagger without CDN), **Supabase** Python client.
 
 ---
 
-## 9. Run with Docker (API + Mongo)
+## Optional: Docker
 
-The repo includes `docker-compose.yml` with `api` and `mongo`. The **`Dockerfile`** must use a valid **JSON-array** `CMD` for Uvicorn, for example:
+The repo includes a `Dockerfile` and `docker-compose.yml`. The API container needs **`SUPABASE_*` variables** (e.g. `environment` or `--env-file .env`); the compose file also defines a **MongoDB** service, which the current app code does **not** use—prefer running the API locally with `.env` unless you adjust compose for your deployment.
 
-```dockerfile
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+Example build/run pattern:
+
+```powershell
+docker build -t aigentless-api .
+docker run --env-file .env -p 8000:8000 aigentless-api
 ```
-
-If the `CMD` line uses single quotes, Docker may reject it — fix to double quotes as above.
-
-For the **API** container to reach Mongo, set `MONGO_URL` to host **`mongo`** (the Compose service name), e.g. `mongodb://mongo:27017`, via env or compose `environment:` — not `127.0.0.1`.
 
 ---
 
-## 10. Project layout (high level)
+## Project layout (high level)
 
 ```
-├── main.py                 # FastAPI app, lifespan, CORS, routers
-├── config/database.py      # PyMongo async client, Beanie init, TLS helpers
-├── models/                 # Beanie documents (User, Lead)
-├── schemas/                # Pydantic request/response models
-├── routes/                 # API routers (properties, leads, …)
+├── main.py                 # FastAPI app, CORS, routers
+├── config/database.py      # Supabase client, startup ping
+├── routes/                 # API routers (e.g. properties)
 ├── services/               # Business logic
-├── scripts/seed_leads.py     # Seed dummy leads
 ├── requirements.txt
-├── docker-compose.yml
 ├── Dockerfile
-└── .env                    # Local only — create yourself, never commit
+├── docker-compose.yml
+└── .env                    # Local only — create from .env.example, never commit
 ```
 
 ---
 
-## 11. Troubleshooting
+## Troubleshooting
 
 | Issue | What to try |
 |-------|-------------|
-| `Activate.ps1` not found | Recreate venv: `python -m venv .venv --clear` then `pip install -r requirements.txt`. |
-| Mongo connection / TLS errors to Atlas | Use local Mongo (`docker compose up -d mongo`) + `MONGO_URL=mongodb://127.0.0.1:27017`; or try `MONGO_TLS_RELAXED=true` (dev only); or another network (e.g. hotspot). |
-| App starts but `/leads` returns **503** | `DB_OPTIONAL_STARTUP=true` with failed DB, or Mongo not running. Fix `MONGO_URL` and restart. |
-| `No module named 'beanie'` | Activate `.venv` and run `pip install -r requirements.txt`. |
-| Swagger UI never loads in browser | Open `/docs` (not `/` alone). This project uses **offline** docs (`fastapi-standalone-docs`) to avoid CDN blocks. |
-| CORS errors from a frontend | `main.py` allows `*` origins; tighten `allow_origins` for production. |
+| `Missing SUPABASE_URL or ...` | Fill `.env`; restart Uvicorn. |
+| **503** on `/properties/*` | Supabase unreachable or ping failed; check URL, key, network, and `properties` table. |
+| `Activate.ps1` not found | Recreate venv: `python -m venv .venv --clear` then reinstall requirements. |
+| Swagger does not load | Use `/docs` (offline docs bundle). |
 
 ---
 
-## 12. Security reminders for contributors
+## Security
 
-- **Never commit `.env`** — it is listed in `.gitignore`.
-- Share **example** values in chat or a template file **without** real passwords (e.g. `MONGO_URL=mongodb+srv://USER:PASS@...` with placeholders).
-- Rotate Atlas credentials if they were ever exposed.
+- Do **not** commit `.env` or real keys.
+- Prefer **service role** only on the server; never expose it in frontend code.
 
 ---
 
-## 13. Quick checklist
+## Checklist
 
-- [ ] Python 3.11+ installed  
+- [ ] Python 3.11+ and Git installed  
 - [ ] Repo cloned  
 - [ ] `.venv` created and `pip install -r requirements.txt`  
-- [ ] `.env` created with `MONGO_URL` and `DB_NAME`  
-- [ ] MongoDB running (Docker or Atlas or local)  
-- [ ] `python scripts/seed_leads.py` (optional)  
+- [ ] `.env` with `SUPABASE_URL`, `SUPABASE_KEY`, and `SUPABASE_SERVICE_ROLE_KEY` (as in `.env.example`)  
+- [ ] Supabase project has `properties` (and policies match your key)  
 - [ ] `uvicorn main:app --reload` and open `/docs`  
-
-You are ready to develop.
