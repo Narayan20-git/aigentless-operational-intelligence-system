@@ -1,0 +1,324 @@
+properties:
+create table public.properties (
+  id uuid not null default gen_random_uuid (),
+  created_at timestamp with time zone not null default now(),
+  name text not null,
+  description text null,
+  address jsonb not null,
+  latitude double precision null,
+  longitude double precision null,
+  units bigint null,
+  floors bigint null,
+  neighborhood_id uuid null,
+  city_id uuid null,
+  utilities jsonb not null default '{}'::jsonb,
+  amenities text[] not null default '{}'::text[],
+  fees jsonb[] not null default '{}'::jsonb[],
+  _num_images bigint not null default '0'::bigint,
+  website text not null default ''::text,
+  attio_list_id text null,
+  concession text not null default ''::text,
+  attio_building_id text null,
+  payment_model text  default 'Subscription'::text,
+  timezone text null,
+  yardi_id text null,
+  yardi_voyager_server_id uuid null,
+  funnel_community_id text null,
+  neighborhood_description text null,
+  neighborhood_highlights jsonb[] null,
+  realpage_pmcid text null,
+  realpage_siteid text null,
+  elise_id text null,
+  entrata_id text null,
+  entrata_subdomain text null,
+  neighborhood_name text null,
+  realpage_revenue_management_enabled boolean null,
+  go_live_date date null,
+  realpage_knock_id text null,
+  tours_start_time double precision null,
+  tours_end_time double precision null,
+  pmc_id uuid null,
+  internal_only boolean not null default true,
+  min_from_campus text null,
+  parking jsonb null default '[]'::jsonb,
+  housing_type text default 'multifamily'::text,
+  entrata_housing_type text null,
+  instagram text null,
+  year_built integer null,
+  geo_highlights jsonb[] null,
+  limit_analytics boolean not null default false,
+  credit_card_hold_enabled boolean null default false,
+  credit_card_hold_amount integer null default 0,
+  pricing_term_strategy text not null default 'global_min'::text,
+  pricing_term_months integer null,
+  requires_id_verification boolean null default true,
+  gtm_head_script text null,
+  gtm_body_script text null,
+  hide_price boolean not null default false,
+  hide_fees boolean not null default false,
+  hide_parking_price boolean not null default false,
+  tours_type text null default 'in_person'::text,
+  engrain_embed_id text null,
+  engrain_origin text null,
+  engrain_asset_id text null,
+  engrain_sightmap_id text null,
+  constraint properties_new_pkey primary key (id),
+  
+  constraint properties_pricing_term_strategy_check check (
+    (
+      pricing_term_strategy = any (array['global_min'::text, 'term_override'::text])
+    )
+  )
+) TABLESPACE pg_default;
+
+create index IF not exists idx_properties_housing_type on public.properties using btree (housing_type) TABLESPACE pg_default;
+
+create index IF not exists idx_properties_name_tsv on public.properties using gist (to_tsvector('simple'::regconfig, lower(name))) TABLESPACE pg_default;
+
+create index IF not exists idx_properties_year_built on public.properties using btree (year_built) TABLESPACE pg_default;
+
+create index IF not exists idx_properties_engrain_embed_id on public.properties using btree (engrain_embed_id) TABLESPACE pg_default;
+
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+
+2. bookings: 
+
+
+create table public.bookings (
+  id uuid not null default gen_random_uuid (),
+  created_at timestamp with time zone not null default now(),
+  floorplan_id uuid not null,
+  start_time timestamp with time zone not null,
+  end_time timestamp with time zone not null,
+  profile_id uuid null,
+  string_profile_id text null,
+  broker_client_id uuid null,
+  pin jsonb not null default '{}'::jsonb,
+  qr_code jsonb not null default '{}'::jsonb,
+  attio_id text null,
+  funnel_id bigint null,
+  attio_tour_id text null,
+  phone text null,
+  name text null,
+  stratis_meta jsonb null,
+  completion_state jsonb null,
+  utm_source text null,
+  utm_medium text null,
+  utm_campaign text null,
+  utm_content text null,
+  utm_term text null,
+  status text  default 'booked'::text ,
+  updated_at timestamp with time zone null default now(),
+  constraint bookings_new_pkey primary key (id)
+)
+
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+
+
+3.booking_payments:
+
+ create table public.booking_payments (
+  id uuid not null default gen_random_uuid (),
+  booking_id uuid not null,
+  property_id uuid not null,
+  payment_intent_id text not null,
+  collateral_amount integer not null,
+  payment_status text not null default 'pending'::text,
+  captured_amount integer null default 0,
+  created_at timestamp with time zone null default now(),
+  updated_at timestamp with time zone null default now(),
+  profile_id uuid null,
+  constraint booking_payments_pkey primary key (id)
+)
+
+
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+
+4. cities
+
+create table public.cities (
+  id uuid not null default gen_random_uuid (),
+  name text not null,
+  state text not null,
+  country text not null,
+  location text null,
+  timezone text null,
+  show_in_onboarding boolean not null default false,
+  state_full_name text not null,
+  show_in_app boolean not null default true,
+  constraint cities_pkey primary key (id),
+  constraint cities_name_state_key unique (name, state)
+)
+
+
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+
+5. feedback
+create table public.feedback (
+  id bigint generated by default as identity not null,
+  created_at timestamp with time zone not null default now(),
+  profile_id uuid null,
+  raw_feedback jsonb null,
+  floorplan_id uuid null,
+  type text null,
+  booking_id uuid null,
+  constraint feedback_pkey primary key (id))
+
+
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+6.floorplans 
+
+create table public.floorplans (
+  id uuid not null default gen_random_uuid (),
+  created_at timestamp with time zone not null default now(),
+  name text not null,
+  description text not null default ''::text,
+  bedrooms bigint not null,
+  bathrooms bigint not null,
+  half_bathrooms bigint null,
+  square_footage bigint null,
+  pets_allowed boolean not null default false,
+  amenities text[] not null default '{}'::text[],
+  tour_id uuid null,
+  property_id uuid null,
+  booking_availability text not null default ''::text,
+  _num_images bigint not null default '0'::bigint,
+  address jsonb null default '{}'::jsonb,
+  half_bedrooms bigint null,
+  yardi_id text null,
+  is_convertible boolean not null default false,
+  realpage_id text null,
+  entrata_floorplan_id text null,
+  visible_override boolean null,
+  engrain_floor_plan_id text null,
+  constraint floorplans_pkey primary key (id),
+  constraint floorplans_id_property_id_key unique (id, property_id)) ;
+
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+7.prospects
+
+
+create table public.prospects (
+  id uuid not null default gen_random_uuid (),
+  created_at timestamp with time zone not null default now(),
+  user_id uuid null,
+  email text null,
+  phone_number text null,
+  first_name text null,
+  last_name text null,
+  applied boolean null default false,
+  leased boolean null default false,
+  ignore boolean null default false,
+  ignore_dev boolean null default false,
+  constraint prospects_pkey primary key (id),
+  constraint prospects_user_id_key unique (user_id),
+  constraint prospects_user_id_fkey foreign KEY (user_id) references auth.users (id) on update CASCADE on delete set null
+) TABLESPACE pg_default;
+
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+8.prospect_events: 
+
+create table public.prospect_events (
+  id uuid not null default gen_random_uuid (),
+  created_at timestamp with time zone not null default now(),
+  property_id uuid not null,
+  prospect_id uuid not null,
+  cms_id uuid not null,
+  event text not null,
+  timestamp timestamp with time zone not null,
+  lead_source text not null,
+  metadata jsonb not null default '{}'::jsonb,
+  ext_event_id text null,
+  booking_id uuid null,
+  ignore boolean null,
+  ignore_dev boolean null,
+  constraint prospect_activity_pkey primary key (id),
+  constraint prospect_activity_property_id_fkey foreign KEY (property_id) references properties (id) on update CASCADE on delete CASCADE,
+  constraint prospect_activity_prospect_id_fkey foreign KEY (prospect_id) references prospects (id) on update CASCADE on delete CASCADE,
+  constraint prospect_events_booking_id_fkey foreign KEY (booking_id) references bookings (id) on update CASCADE on delete set null
+) TABLESPACE pg_default;
+
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+9.spaces: 
+create table public.spaces (
+  id uuid not null default gen_random_uuid (),
+  unit_id uuid not null,
+  is_affordable boolean null,
+  has_pricing boolean null,
+  make_ready_date date null,
+  availability_status text not null,
+  available_date date null,
+  marketing_unit_number text null,
+  entrata_space_id text null,
+  min_rent numeric null,
+  max_rent numeric null,
+  min_deposit numeric null,
+  max_deposit numeric null,
+  occupancy_type text null,
+  exclusion_reason text null,
+  created_at timestamp with time zone null default now(),
+  updated_at timestamp with time zone null default now(),
+  rentable boolean null default false,
+  tourable boolean null default false,
+  constraint spaces_pkey primary key (id)) TABLESPACE pg_default;
+
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+10.tours:
+
+create table public.tours (
+  id uuid not null default gen_random_uuid (),
+  created_at timestamp with time zone not null default now(),
+  description text not null default ''::text,
+  title text not null default ''::text,
+  property_id uuid null,
+  estimated_minutes bigint not null default '30'::bigint,
+  audio_sync_status text  default 'Synced'::text,
+  visible boolean not null default true,
+  locked_for_sync boolean not null default false,
+  tour_concession text null,
+  archived_at timestamp with time zone null,
+  constraint tours_new_pkey primary key (id),
+  constraint tours_property_id_fkey foreign KEY (property_id) references properties (id) on update CASCADE on delete set null
+) TABLESPACE pg_default;
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+11. 
+
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+12.
+
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+13.
+
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+14
+
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+__________________________________________________________________________________________________________________________________________________
+

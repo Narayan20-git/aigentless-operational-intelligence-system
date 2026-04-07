@@ -81,7 +81,21 @@ import certifi
 from beanie import init_beanie
 from pymongo import AsyncMongoClient
 
+from models.booking_model import Booking
+from models.booking_payment_model import BookingPayment
+from models.city_model import City
+from models.feedback_model import Feedback
+from models.floorplan_model import Floorplan
 from models.lead_model import Lead
+from models.property_image_model import PropertyImage
+from models.property_model import Property
+from models.prospect_event_model import ProspectEvent
+from models.prospect_model import Prospect
+from models.space_model import Space
+from models.tour_model import Tour
+from models.tour_step_model import TourStep
+from models.unit_image_model import UnitImage
+from models.unit_model import Unit
 from models.user_model import User
 
 DEFAULT_MONGO_URL = "mongodb://localhost:27017"
@@ -158,7 +172,27 @@ async def init_db() -> None:
     global _db_ready
     client = get_client()
     db = client[get_db_name()]
-    await init_beanie(database=db, document_models=[User, Lead])
+    await init_beanie(
+        database=db,
+        document_models=[
+            User,
+            Lead,
+            Booking,
+            BookingPayment,
+            City,
+            Feedback,
+            Floorplan,
+            Property,
+            PropertyImage,
+            Prospect,
+            ProspectEvent,
+            Space,
+            Tour,
+            TourStep,
+            Unit,
+            UnitImage,
+        ],
+    )
     _db_ready = True
 
 
