@@ -1,40 +1,43 @@
-from contextlib import asynccontextmanager
-
+"""
+Aigentless POC — FastAPI Backend
+Property Onboarding Module
+"""
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
-from fastapi_standalone_docs import StandaloneDocs
+from contextlib import asynccontextmanager
+import asyncio
 
-from config.database import close_db, startup_database
-from routes.lead_routes import router as lead_router
-from routes.property_routes import router as property_router
-
+from app.routers import onboarding, checklist, generate_content
+from app.scheduler import start_scheduler
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.db_available = await startup_database()
+    # Start background scheduler on startup
+    scheduler = start_scheduler()
     yield
-    await close_db()
+    # Shutdown scheduler on exit
+    scheduler.shutdown()
 
+app = FastAPI(
+    title="Aigentless — Property Onboarding API",
+    description="AI-Powered Leasing Platform — Property Onboarding Module",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
-app = FastAPI(title="Aigentless Backend", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-StandaloneDocs(app=app)
-app.include_router(property_router, prefix="/properties", tags=["Properties"])
-app.include_router(lead_router, prefix="/leads", tags=["Leads"])
 
+# Routers
+app.include_router(onboarding.router,       prefix="/api/v1", tags=["Onboarding"])
+app.include_router(checklist.router,        prefix="/api/v1", tags=["Checklist"])
+app.include_router(generate_content.router, prefix="/api/v1", tags=["AI Content"])
 
-@app.get("/", include_in_schema=False)
-async def root():
-    return RedirectResponse(url="/docs", status_code=307)
-
-
-@app.get("/doc", include_in_schema=False)
-async def doc_typo():
-    return RedirectResponse(url="/docs", status_code=307)
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "aigentless-onboarding"}
