@@ -53,7 +53,7 @@ async def list_onboarding_properties(
     """
     # Get properties
     prop_query = supabase.table("properties").select(
-        "id, name, description, units, go_live_date, updated_at"
+        "id, name, description, units, go_live_date"
     )
     if property_id:
         prop_query = prop_query.eq("id", property_id)
@@ -104,7 +104,7 @@ async def get_onboarding_detail(property_id: str):
     """
     # Property info
     prop_res = supabase.table("properties") \
-        .select("id, name, description, units, year_built, website, amenities, go_live_date, updated_at") \
+        .select("id, name, description, units, year_built, website, amenities, go_live_date") \
         .eq("id", property_id) \
         .single() \
         .execute()
