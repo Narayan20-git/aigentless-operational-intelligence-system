@@ -542,6 +542,7 @@ def _build_inventory_vacant_sync(property_id: str | None = None, days: int = 7) 
                 }
             )
 
+        vacant_units.sort(key=lambda x: (str(x.get("property") or ""), str(x.get("unitCode") or "")))
         vacant_units = vacant_units[:30]
 
     n = len(vacant_units)
