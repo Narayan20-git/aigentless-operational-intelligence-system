@@ -18,6 +18,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Aigentless Backend", lifespan=lifespan)
+# CORS: any browser origin. Wildcard requires allow_credentials=False (FastAPI/Starlette).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from config.database import db_is_ready, startup_database
 from services.dashboard_service import (
@@ -11,6 +11,7 @@ from services.dashboard_service import (
     get_portfolio_overview_payload,
     get_profile_payload,
     get_property_onboarding_payload,
+    get_property_options_payload,
     get_weekly_brief_payload,
 )
 
@@ -31,29 +32,49 @@ async def require_supabase(request: Request) -> None:
 router = APIRouter(dependencies=[Depends(require_supabase)])
 
 
+@router.get("/properties/options")
+async def properties_options():
+    return await get_property_options_payload()
+
+
 @router.get("/dashboard/home")
-async def dashboard_home():
-    return await get_home_payload()
+async def dashboard_home(
+    property_id: str | None = Query(None, description="Filter widgets to this property UUID"),
+    days: int = Query(7, description="Rolling window in days (7, 30, or 90)"),
+):
+    return await get_home_payload(property_id=property_id, days=days)
 
 
 @router.get("/leads/summary")
-async def leads_summary():
-    return await get_leads_summary_payload()
+async def leads_summary(
+    property_id: str | None = Query(None),
+    days: int = Query(7),
+):
+    return await get_leads_summary_payload(property_id=property_id, days=days)
 
 
 @router.get("/inventory/vacant-units")
-async def inventory_vacant_units():
-    return await get_inventory_payload()
+async def inventory_vacant_units(
+    property_id: str | None = Query(None),
+    days: int = Query(7),
+):
+    return await get_inventory_payload(property_id=property_id, days=days)
 
 
 @router.get("/properties/onboarding")
-async def properties_onboarding():
-    return await get_property_onboarding_payload()
+async def properties_onboarding(
+    property_id: str | None = Query(None),
+    days: int = Query(7),
+):
+    return await get_property_onboarding_payload(property_id=property_id, days=days)
 
 
 @router.get("/portfolio/overview")
-async def portfolio_overview():
-    return await get_portfolio_overview_payload()
+async def portfolio_overview(
+    property_id: str | None = Query(None),
+    days: int = Query(7),
+):
+    return await get_portfolio_overview_payload(property_id=property_id, days=days)
 
 
 @router.get("/briefs/weekly")

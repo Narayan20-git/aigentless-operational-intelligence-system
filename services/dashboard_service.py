@@ -1,403 +1,700 @@
+"""
+Live dashboard payloads from Supabase tables (no ui_payloads for leads/inventory).
+
+Lead Prioritization (/api/leads/summary):
+  prospects -> prospect_events (prospect_id), properties (property_id),
+  units (property_id), bookings (profile_id = prospect id for seeded rows).
+
+Inventory (/api/inventory/vacant-units):
+  spaces (unit_id -> units.id) -> properties, floorplans,
+  tour_steps (unit_id), bookings (floorplan_id, applications proxy).
+"""
 import asyncio
-import random
+import copy
+from collections import Counter, defaultdict
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from config.database import get_client
 
 
-def _select(table: str, fields: str = "*", limit: int = 100) -> list[dict[str, Any]]:
-    res = get_client().table(table).select(fields).limit(limit).execute()
-    return res.data or []
+def _fetch_payload(key: str) -> dict[str, Any]:
+    res = get_client().table("ui_payloads").select("payload").eq("key", key).limit(1).execute()
+    data = res.data or []
+    if not data:
+        raise RuntimeError(f"Missing UI payload in DB for key: {key}")
+    payload = data[0].get("payload")
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Invalid payload format for key: {key}")
+    return payload
 
 
-async def _aselect(table: str, fields: str = "*", limit: int = 100) -> list[dict[str, Any]]:
-    return await asyncio.to_thread(_select, table, fields, limit)
+async def _aget_payload(key: str) -> dict[str, Any]:
+    return await asyncio.to_thread(_fetch_payload, key)
 
 
-def _iso_now_minus(hours: int) -> str:
-    return (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
+_IN_CHUNK = 12
 
 
-async def get_home_payload() -> dict[str, Any]:
-    properties, units, prospects = await asyncio.gather(
-        _aselect("properties", "id,name,address", 30),
-        _aselect("units", "id,unit,property_id", 40),
-        _aselect("prospects", "id,first_name,last_name,created_at", 40),
+def normalize_dashboard_days(days: int) -> int:
+    if days in (7, 30, 90):
+        return days
+    return 7
+
+
+def _chunks(seq: list[Any], size: int = _IN_CHUNK):
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
+
+
+def _parse_ts(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    if isinstance(value, str):
+        try:
+            s = value.replace("Z", "+00:00")
+            return datetime.fromisoformat(s)
+        except ValueError:
+            return None
+    return None
+
+
+def _heat_from_engagement(
+    events: list[dict[str, Any]],
+    last_ts: datetime | None,
+    created_ts: datetime | None,
+    has_booking: bool,
+) -> str:
+    """Derive hot/warm/cold from events already scoped to the selected date range + recency + bookings."""
+    now = datetime.now(UTC)
+    n_in = len(events)
+
+    ref = last_ts or created_ts
+    hours: float | None = None
+    if ref:
+        r = ref if ref.tzinfo else ref.replace(tzinfo=UTC)
+        hours = (now - r).total_seconds() / 3600.0
+
+    if has_booking or n_in >= 3 or (hours is not None and hours < 24):
+        return "hot"
+    if n_in >= 1 or (hours is not None and hours < 24 * 7):
+        return "warm"
+    return "cold"
+
+
+def _priority_from_flags(applied: bool | None, leased: bool | None) -> str:
+    a, l = bool(applied), bool(leased)
+    if not a and not l:
+        return "critical"
+    if a and not l:
+        return "moderate"
+    return "low"
+
+
+def _build_leads_summary_sync(property_id: str | None = None, days: int = 7) -> dict[str, Any]:
+    """Live data from prospects, prospect_events, properties, units."""
+    client = get_client()
+    days = normalize_dashboard_days(days)
+    since = datetime.now(UTC) - timedelta(days=days)
+    pres = (
+        client.table("prospects")
+        .select("id,first_name,last_name,applied,leased,created_at,ignore")
+        .order("created_at", desc=True)
+        .limit(80)
+        .execute()
     )
-
-    property_name = {p["id"]: p.get("name", "Unknown Property") for p in properties}
-
-    at_risk_units = []
-    for i, u in enumerate(units[:20], start=1):
-        at_risk_units.append(
-            {
-                "unit": u.get("unit") or f"U-{i:03d}",
-                "risk": "high" if i % 3 == 0 else "medium",
-                "vacantLabel": f"{5 + i} days vacant",
-                "property": property_name.get(u.get("property_id"), "Unknown Property"),
-                "reason": "Low inquiry velocity in the last 7 days",
-            }
-        )
-
-    follow_up = []
-    for i, p in enumerate(prospects[:20], start=1):
-        name = f"{p.get('first_name') or 'Prospect'} {p.get('last_name') or i}".strip()
-        follow_up.append(
-            {
-                "name": name,
-                "property": properties[i % max(1, len(properties))].get("name", "Unknown Property")
-                if properties
-                else "Unknown Property",
-                "detail": "Needs pricing clarification before applying",
-                "heat": "hot" if i % 4 == 0 else ("warm" if i % 2 == 0 else "cold"),
-                "timeAgo": f"{i}h ago",
-                "channel": "sms" if i % 2 == 0 else "email",
-            }
-        )
-
-    return {
-        "locale": "en-US",
-        "headerSubtext": "Portfolio pulse and action queue",
-        "dailyAiBrief": {
-            "title": "Daily AI Brief",
-            "subtitle": "What changed since yesterday",
-            "paragraphs": [
-                "Lead quality improved across downtown properties.",
-                "Two assets show rising vacancy pressure in 1BHK inventory.",
-            ],
-            "fullBriefPath": "/ai",
-        },
-        "priorityActions": {
-            "items": [
-                {
-                    "id": "pa-1",
-                    "tag": "high",
-                    "icon": "alert",
-                    "title": "Launch outreach campaign for stale units",
-                    "lines": ["8 units are beyond 14 days vacant."],
-                },
-                {
-                    "id": "pa-2",
-                    "tag": "medium",
-                    "icon": "sparkles",
-                    "title": "Tighten pricing on high-tour low-app units",
-                    "lines": ["Conversion gap persists in 2BHK segment."],
-                },
-            ]
-        },
-        "atRiskUnits": {"summaryValue": str(len(at_risk_units)), "items": at_risk_units},
-        "launchBlockers": {
-            "items": [
-                {
-                    "name": p.get("name", "Property"),
-                    "tag": "blocker",
-                    "percent": random.randint(35, 90),
-                    "issue": "Onboarding checklist incomplete",
-                    "detail": "Missing integration credential validation.",
-                }
-                for p in properties[:20]
-            ]
-        },
-        "followUpQueue": {"items": follow_up},
-        "tourInsights": {
-            "items": [
-                {
-                    "tone": "neutral" if i % 3 else "negative",
-                    "property": p.get("name", "Property"),
-                    "text": "Prospects mention commute and parking most often.",
-                    "mentions": i + 2,
-                }
-                for i, p in enumerate(properties[:20])
-            ],
-            "trend": "Objection volume stable week-over-week",
-            "recommendedAction": "Emphasize transit and parking offers in AI scripts",
-        },
-    }
-
-
-async def get_leads_summary_payload() -> dict[str, Any]:
-    prospects, properties, units = await asyncio.gather(
-        _aselect("prospects", "id,first_name,last_name,created_at,applied,leased", 100),
-        _aselect("properties", "id,name", 40),
-        _aselect("units", "id,unit,property_id", 80),
-    )
-    if not prospects:
+    rows_in = [r for r in (pres.data or []) if not r.get("ignore")]
+    if not rows_in:
         return {"total": 0, "hot": 0, "warm": 0, "cold": 0, "data": []}
 
-    property_rows = properties or [{"id": None, "name": "Default Property"}]
-    unit_rows = units or [{"unit": "U-001", "property_id": None}]
-    cards = []
+    p_ids = [str(r["id"]) for r in rows_in]
+    events_raw: list[dict[str, Any]] = []
+    chunk = 40
+    for i in range(0, len(p_ids), chunk):
+        part = p_ids[i : i + chunk]
+        er = (
+            client.table("prospect_events")
+            .select("prospect_id,property_id,timestamp,event")
+            .in_("prospect_id", part)
+            .execute()
+        )
+        events_raw.extend(er.data or [])
+
+    by_prospect: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for e in events_raw:
+        pid = str(e.get("prospect_id") or "")
+        if pid:
+            by_prospect[pid].append(e)
+
+    booking_by_prospect: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for i in range(0, len(p_ids), chunk):
+        part = p_ids[i : i + chunk]
+        br = (
+            client.table("bookings")
+            .select("profile_id,start_time,end_time")
+            .in_("profile_id", part)
+            .execute()
+        )
+        for row in br.data or []:
+            pid = str(row.get("profile_id") or "")
+            if pid:
+                booking_by_prospect[pid].append(row)
+
+    fp_for_prop: set[str] = set()
+    if property_id:
+        fr = client.table("floorplans").select("id").eq("property_id", property_id).limit(500).execute()
+        fp_for_prop = {str(x["id"]) for x in (fr.data or [])}
+
+    if property_id:
+        def _prospect_in_property(prow: dict[str, Any]) -> bool:
+            pr = str(prow["id"])
+            evs = by_prospect.get(pr, [])
+            if any(str(e.get("property_id")) == property_id for e in evs):
+                return True
+            for b in booking_by_prospect.get(pr, []):
+                if str(b.get("floorplan_id")) in fp_for_prop:
+                    return True
+            return False
+
+        rows_in = [r for r in rows_in if _prospect_in_property(r)]
+        if not rows_in:
+            return {"total": 0, "hot": 0, "warm": 0, "cold": 0, "data": []}
+
+    prop_ids_set: set[str] = set()
+    for e in events_raw:
+        pid = e.get("property_id")
+        if pid:
+            prop_ids_set.add(str(pid))
+    if property_id:
+        prop_ids_set.add(property_id)
+
+    prop_names: dict[str, str] = {}
+    for batch in _chunks(list(prop_ids_set), _IN_CHUNK):
+        pr = client.table("properties").select("id,name").in_("id", batch).execute()
+        for p in pr.data or []:
+            prop_names[str(p["id"])] = p.get("name") or "Property"
+
+    # One unit per property for display (first by unit code)
+    units_by_prop: dict[str, dict[str, Any]] = {}
+    if property_id:
+        ur = (
+            client.table("units")
+            .select("id,unit,property_id")
+            .eq("property_id", property_id)
+            .order("unit")
+            .limit(200)
+            .execute()
+        )
+        for u in ur.data or []:
+            pidu = str(u.get("property_id") or "")
+            if pidu and pidu not in units_by_prop:
+                units_by_prop[pidu] = u
+    elif prop_ids_set:
+        for batch in _chunks(list(prop_ids_set), _IN_CHUNK):
+            ur = (
+                client.table("units")
+                .select("id,unit,property_id")
+                .in_("property_id", batch)
+                .order("unit")
+                .limit(200)
+                .execute()
+            )
+            for u in ur.data or []:
+                pidu = str(u.get("property_id") or "")
+                if pidu and pidu not in units_by_prop:
+                    units_by_prop[pidu] = u
+
+    lead_rows: list[dict[str, Any]] = []
     hot = warm = cold = 0
-    for i, p in enumerate(prospects[:30], start=1):
-        status = "hot" if i % 3 == 0 else ("warm" if i % 3 == 1 else "cold")
-        if status == "hot":
+
+    for r in rows_in:
+        pid = str(r["id"])
+        created = _parse_ts(r.get("created_at"))
+        evs = by_prospect.get(pid, [])
+
+        def _in_selected_range(ts_raw: Any) -> bool:
+            t = _parse_ts(ts_raw)
+            if not t:
+                return False
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=UTC)
+            return t >= since
+
+        evs_w = [e for e in evs if _in_selected_range(e.get("timestamp"))]
+        bks_w = [b for b in booking_by_prospect.get(pid, []) if _in_selected_range(b.get("start_time"))]
+        evs_display = evs_w if evs_w else evs
+        evs_sorted = sorted(
+            evs_display,
+            key=lambda x: _parse_ts(x.get("timestamp")) or datetime.min.replace(tzinfo=UTC),
+            reverse=True,
+        )
+        last_ev = evs_sorted[0] if evs_sorted else None
+        last_ts = _parse_ts(last_ev.get("timestamp")) if last_ev else None
+
+        all_ts: list[datetime] = []
+        for e in evs_display:
+            t = _parse_ts(e.get("timestamp"))
+            if t:
+                all_ts.append(t if t.tzinfo else t.replace(tzinfo=UTC))
+        last_contact_dt = max(all_ts) if all_ts else None
+
+        tour_candidates: list[datetime] = []
+        for e in evs_w:
+            evname = (e.get("event") or "").lower()
+            if "tour" in evname:
+                t = _parse_ts(e.get("timestamp"))
+                if t:
+                    tour_candidates.append(t if t.tzinfo else t.replace(tzinfo=UTC))
+        tour_ts = max(tour_candidates) if tour_candidates else None
+        if tour_ts is None:
+            booking_starts: list[datetime] = []
+            for b in bks_w:
+                t = _parse_ts(b.get("start_time"))
+                if t:
+                    booking_starts.append(t if t.tzinfo else t.replace(tzinfo=UTC))
+            if not booking_starts:
+                for b in booking_by_prospect.get(pid, []):
+                    t = _parse_ts(b.get("start_time"))
+                    if t:
+                        booking_starts.append(t if t.tzinfo else t.replace(tzinfo=UTC))
+            tour_ts = max(booking_starts) if booking_starts else None
+
+        last_ts_heat: datetime | None = None
+        if evs_w:
+            ev_sw = sorted(
+                evs_w,
+                key=lambda x: _parse_ts(x.get("timestamp")) or datetime.min.replace(tzinfo=UTC),
+                reverse=True,
+            )
+            last_ts_heat = _parse_ts(ev_sw[0].get("timestamp")) if ev_sw else None
+        has_booking = len(bks_w) > 0
+        heat = _heat_from_engagement(evs_w, last_ts_heat, created, has_booking)
+        if heat == "hot":
             hot += 1
-        elif status == "warm":
+        elif heat == "warm":
             warm += 1
         else:
             cold += 1
-        prop = property_rows[i % len(property_rows)]
-        unit = unit_rows[i % len(unit_rows)]
-        # Priority derives from DB state so the UI remains meaningful:
-        # - Not applied / not leased => critical
-        # - Applied / not leased => moderate
-        # - Leased => low
-        if not p.get("applied") and not p.get("leased"):
-            priority = "critical"
-        elif p.get("applied") and not p.get("leased"):
-            priority = "moderate"
-        else:
-            priority = "low"
 
-        cards.append(
+        prid = str(last_ev.get("property_id")) if last_ev and last_ev.get("property_id") else None
+        if not prid and evs_sorted:
+            for e in reversed(evs_sorted):
+                if e.get("property_id"):
+                    prid = str(e["property_id"])
+                    break
+
+        prop_name = prop_names.get(prid, "Property") if prid else "Property"
+        unit_row = units_by_prop.get(prid) if prid else None
+        unit_label = (unit_row.get("unit") or "—") if unit_row else "—"
+
+        fn = (r.get("first_name") or "").strip()
+        ln = (r.get("last_name") or "").strip()
+        name = f"{fn} {ln}".strip() or "Lead"
+
+        tour_dt = tour_ts or last_contact_dt or created or datetime.now(UTC)
+        contact_dt = last_contact_dt or last_ts or created or datetime.now(UTC)
+        tour_iso = tour_dt.isoformat()
+        contact_iso = contact_dt.isoformat()
+
+        priority = _priority_from_flags(r.get("applied"), r.get("leased"))
+
+        tags: list[str] = []
+        if r.get("leased"):
+            tags.append("Leased")
+        elif r.get("applied"):
+            tags.append("Applied")
+        else:
+            tags.append("New Lead")
+
+        lead_rows.append(
             {
-                "id": str(p["id"]),
-                "name": f"{p.get('first_name') or 'Lead'} {p.get('last_name') or i}".strip(),
-                "status": status,
+                "id": pid,
+                "name": name,
+                "status": heat,
                 "priority": priority,
-                "property": prop.get("name", "Unknown Property"),
-                "unit": unit.get("unit", f"U-{i:03d}"),
-                "tour_time": _iso_now_minus(48 - i),
-                "last_contact": _iso_now_minus(i),
-                "tags": ["New Lead"] if i % 2 == 0 else ["Returning"],
+                "property": prop_name,
+                "unit": unit_label,
+                "tour_time": tour_iso,
+                "last_contact": contact_iso,
+                "tags": tags,
                 "recommended_action": "Share limited-time offer and schedule a call",
                 "objections": ["Budget", "Move-in timing"],
                 "alternates": ["Unit with lower rent", "Flexible move-in date"],
                 "ai_draft": "Hi! We have a matching option available this week.",
             }
         )
-    return {"total": len(cards), "hot": hot, "warm": warm, "cold": cold, "data": cards}
+
+    return {
+        "total": len(lead_rows),
+        "hot": hot,
+        "warm": warm,
+        "cold": cold,
+        "data": lead_rows,
+    }
 
 
-async def get_inventory_payload() -> dict[str, Any]:
-    units, properties, spaces = await asyncio.gather(
-        _aselect("units", "id,unit,property_id,floorplan_id", 200),
-        _aselect("properties", "id,name", 40),
-        _aselect("spaces", "id,unit_id,availability_status,available_date", 200),
+def _days_vacant(available_date: Any, fallback: datetime | None) -> int:
+    today = date.today()
+    if available_date:
+        try:
+            if isinstance(available_date, date) and not isinstance(available_date, datetime):
+                d = available_date
+            else:
+                d = date.fromisoformat(str(available_date)[:10])
+            return max(0, (today - d).days)
+        except (ValueError, TypeError):
+            pass
+    if fallback:
+        if fallback.tzinfo is None:
+            fallback = fallback.replace(tzinfo=UTC)
+        return max(0, (date.today() - fallback.date()).days)
+    return 0
+
+
+def _conversion_rate_pct(tours: int, apps: int) -> float:
+    """Share of applications in (tours + apps), matches UI when tours=0 and apps>0."""
+    total = tours + apps
+    if total <= 0:
+        return 0.0
+    return (apps / total) * 100.0
+
+
+def _inventory_status_from_conversion(conv_pct: float) -> str:
+    """healthy: >90%; stale: 60–90%; atRisk: <60%."""
+    if conv_pct > 90:
+        return "healthy"
+    if conv_pct >= 60:
+        return "stale"
+    return "atRisk"
+
+
+def _tour_steps_counts_by_unit(client: Any, unit_ids: list[str]) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    if not unit_ids:
+        return counts
+    for batch in _chunks(list(unit_ids), _IN_CHUNK):
+        ts = client.table("tour_steps").select("unit_id").in_("unit_id", batch).execute()
+        for row in ts.data or []:
+            u = row.get("unit_id")
+            if u:
+                counts[str(u)] += 1
+    return counts
+
+
+def _booking_counts_since_by_floorplan(client: Any, fp_ids: list[str], since: datetime) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    if not fp_ids:
+        return counts
+    since_iso = since.isoformat()
+    for batch in _chunks(list(fp_ids), _IN_CHUNK):
+        try:
+            bk = (
+                client.table("bookings")
+                .select("floorplan_id,start_time")
+                .in_("floorplan_id", batch)
+                .gte("start_time", since_iso)
+                .execute()
+            )
+            rows = bk.data or []
+        except Exception:
+            bk = client.table("bookings").select("floorplan_id,start_time").in_("floorplan_id", batch).execute()
+            rows = []
+            for row in bk.data or []:
+                t = _parse_ts(row.get("start_time"))
+                if not t:
+                    continue
+                if t.tzinfo is None:
+                    t = t.replace(tzinfo=UTC)
+                if t >= since:
+                    rows.append(row)
+        for row in rows:
+            fp = row.get("floorplan_id")
+            if fp:
+                counts[str(fp)] += 1
+    return counts
+
+
+def _floorplan_bedrooms_map(client: Any, fp_ids: list[str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not fp_ids:
+        return out
+    for batch in _chunks(list(fp_ids), _IN_CHUNK):
+        fpr = client.table("floorplans").select("id,bedrooms").in_("id", batch).execute()
+        for fp in fpr.data or []:
+            out[str(fp["id"])] = str(fp.get("bedrooms") or "1")
+    return out
+
+
+def _build_inventory_vacant_sync(property_id: str | None = None, days: int = 7) -> dict[str, Any]:
+    """Live vacant inventory from spaces + units + properties; metrics from tour_steps + bookings."""
+    client = get_client()
+    days = normalize_dashboard_days(days)
+    since = datetime.now(UTC) - timedelta(days=days)
+    sp = (
+        client.table("spaces")
+        .select("unit_id,available_date,availability_status,created_at")
+        .eq("availability_status", "available")
+        .limit(100)
+        .execute()
     )
-    property_name = {p["id"]: p.get("name", "Property") for p in properties}
-    space_by_unit = {s.get("unit_id"): s for s in spaces}
+    spaces_list = sp.data or []
+    if not spaces_list:
+        return {
+            "page": {"title": "Inventory Intelligence", "description": "Vacancy and conversion health"},
+            "metricCards": [
+                {"id": "vacant", "value": "0", "label": "Vacant Units"},
+                {"id": "atRisk", "value": "0", "label": "At Risk"},
+                {"id": "stale", "value": "0", "label": "Stale"},
+            ],
+            "tableTitle": "Vacant Units",
+            "emptyStateText": "No vacant inventory",
+            "statusFilterLabels": {
+                "all": "All",
+                "atRisk": "At Risk",
+                "stale": "Stale",
+                "healthy": "Healthy",
+            },
+            "vacantUnits": [],
+        }
 
-    vacant = []
-    for i, u in enumerate(units[:40], start=1):
-        s = space_by_unit.get(u.get("id"), {})
-        status = "atRisk" if i % 4 == 0 else ("stale" if i % 5 == 0 else "healthy")
-        days = 5 + i
-        tours = i % 8
-        apps = i % 4
-        conv = f"{int((apps / max(1, tours)) * 100)}%" if tours else "0%"
-        vacant.append(
-            {
-                "id": str(u["id"]),
-                "unitCode": u.get("unit") or f"U-{i:03d}",
-                "property": property_name.get(u.get("property_id"), "Unknown Property"),
-                "unitType": "1BHK" if i % 2 == 0 else "2BHK",
-                "status": status,
-                "days": days,
-                "tours": tours,
-                "apps": apps,
-                "conv": conv,
-                "whyMatters": f"Availability status: {s.get('availability_status', 'vacant')}",
-                "recommendedAction": "Run pricing + content refresh experiment for 7 days",
-            }
-        )
+    unit_ids: list[str] = []
+    space_by_unit: dict[str, dict[str, Any]] = {}
+    for s in spaces_list:
+        uid = s.get("unit_id")
+        if not uid:
+            continue
+        uid = str(uid)
+        if uid not in space_by_unit:
+            unit_ids.append(uid)
+        space_by_unit[uid] = s
 
-    table_units = vacant[:30]
+    if not unit_ids:
+        vacant_units: list[dict[str, Any]] = []
+    else:
+        units_list: list[dict[str, Any]] = []
+        for batch in _chunks(unit_ids, _IN_CHUNK):
+            ur = (
+                client.table("units")
+                .select("id,unit,property_id,floorplan_id,created_at,move_in_date")
+                .in_("id", batch)
+                .execute()
+            )
+            units_list.extend(ur.data or [])
+        if property_id:
+            units_list = [u for u in units_list if str(u.get("property_id")) == property_id]
+
+        prop_ids = list({str(u["property_id"]) for u in units_list if u.get("property_id")})
+        prop_names: dict[str, str] = {}
+        for batch in _chunks(prop_ids, _IN_CHUNK):
+            pr = client.table("properties").select("id,name").in_("id", batch).execute()
+            for p in pr.data or []:
+                prop_names[str(p["id"])] = p.get("name") or "Property"
+
+        uuid_list = [str(u["id"]) for u in units_list]
+        tour_counts = _tour_steps_counts_by_unit(client, uuid_list)
+
+        fp_ids = list({str(u["floorplan_id"]) for u in units_list if u.get("floorplan_id")})
+        app_counts = _booking_counts_since_by_floorplan(client, fp_ids, since)
+
+        fp_bedrooms = _floorplan_bedrooms_map(client, fp_ids)
+
+        vacant_units = []
+        for u in units_list:
+            uid = str(u["id"])
+            sp_row = space_by_unit.get(uid) or {}
+            pid = str(u.get("property_id") or "")
+            pname = prop_names.get(pid, "Property")
+            fp = str(u.get("floorplan_id") or "")
+            avail = sp_row.get("available_date")
+            created_u = _parse_ts(u.get("created_at"))
+            vacancy_days = _days_vacant(avail, created_u)
+            tours_n = tour_counts.get(uid, 0)
+            apps_n = app_counts.get(fp, 0) if fp else 0
+            conv_float = _conversion_rate_pct(tours_n, apps_n)
+            conv_pct_int = int(round(conv_float))
+            status = _inventory_status_from_conversion(conv_float)
+            br = fp_bedrooms.get(fp, "1") if fp else "1"
+            utype = f"{br} BR"
+
+            vacant_units.append(
+                {
+                    "id": uid,
+                    "unitCode": u.get("unit") or uid[:8],
+                    "property": pname,
+                    "unitType": utype,
+                    "status": status,
+                    "days": vacancy_days,
+                    "tours": tours_n,
+                    "apps": apps_n,
+                    "conv": f"{conv_pct_int}%",
+                    "whyMatters": "Availability velocity is below benchmark.",
+                    "recommendedAction": "Run pricing + content refresh experiment for 7 days",
+                }
+            )
+
+        vacant_units = vacant_units[:30]
+
+    n = len(vacant_units)
+    at_risk = sum(1 for x in vacant_units if x["status"] == "atRisk")
+    stale_n = sum(1 for x in vacant_units if x["status"] == "stale")
 
     return {
         "page": {"title": "Inventory Intelligence", "description": "Vacancy and conversion health"},
         "metricCards": [
-            {"id": "vacant", "value": str(len(table_units)), "label": "Vacant Units"},
-            {"id": "atRisk", "value": str(sum(1 for v in table_units if v["status"] == "atRisk")), "label": "At Risk"},
-            {"id": "stale", "value": str(sum(1 for v in table_units if v["status"] == "stale")), "label": "Stale"},
+            {"id": "vacant", "value": str(n), "label": "Vacant Units"},
+            {"id": "atRisk", "value": str(at_risk), "label": "At Risk"},
+            {"id": "stale", "value": str(stale_n), "label": "Stale"},
         ],
         "tableTitle": "Vacant Units",
         "emptyStateText": "No vacant inventory",
-        "statusFilterLabels": {"all": "All", "atRisk": "At Risk", "stale": "Stale", "healthy": "Healthy"},
-        "vacantUnits": table_units,
+        "statusFilterLabels": {
+            "all": "All",
+            "atRisk": "At Risk",
+            "stale": "Stale",
+            "healthy": "Healthy",
+        },
+        "vacantUnits": vacant_units,
     }
 
 
-async def get_property_onboarding_payload() -> dict[str, Any]:
-    properties = await _aselect("properties", "id,name,created_at,go_live_date", 100)
-    data = []
-    today = date.today()
-    for i, p in enumerate(properties[:30], start=1):
-        go_live_raw = p.get("go_live_date")
-        go_live: date | None = None
-        if isinstance(go_live_raw, str):
-            try:
-                go_live = date.fromisoformat(go_live_raw[:10])
-            except ValueError:
-                go_live = None
-        if go_live is None:
-            go_live = today + timedelta(days=10)
+def _list_property_options_sync() -> list[dict[str, str]]:
+    client = get_client()
+    r = client.table("properties").select("id,name").order("name").limit(500).execute()
+    return [{"id": str(x["id"]), "name": (x.get("name") or "Property").strip()} for x in (r.data or [])]
 
-        days_to_go_live = (go_live - today).days
-        if days_to_go_live <= -7:
-            status = "ready"
-            completeness = 90 + (i % 11)
-        elif days_to_go_live <= 14:
-            status = "inProgress"
-            completeness = 62 + (i % 26)
-        else:
-            status = "blocked"
-            completeness = 35 + (i % 20)
 
-        data.append(
+def _filter_home_payload_sync(payload: dict[str, Any], property_id: str | None) -> dict[str, Any]:
+    if not property_id:
+        return payload
+    client = get_client()
+    pr = client.table("properties").select("name").eq("id", property_id).limit(1).execute()
+    if not pr.data:
+        return payload
+    pname = (pr.data[0].get("name") or "").strip()
+    if not pname:
+        return payload
+    out = copy.deepcopy(payload)
+    for key, sk in [
+        ("atRiskUnits", "items"),
+        ("launchBlockers", "items"),
+        ("followUpQueue", "items"),
+        ("tourInsights", "items"),
+    ]:
+        block = out.get(key)
+        if not isinstance(block, dict):
+            continue
+        items = block.get(sk) or []
+        if not isinstance(items, list):
+            continue
+        filtered = [
+            x
+            for x in items
+            if isinstance(x, dict)
+            and ((str(x.get("property") or "").strip() == pname) or (str(x.get("name") or "").strip() == pname))
+        ]
+        block[sk] = filtered
+        if key in ("atRiskUnits", "launchBlockers", "followUpQueue"):
+            block["summaryValue"] = str(len(filtered))
+    return out
+
+
+def _filter_portfolio_sync(payload: dict[str, Any], property_id: str | None) -> dict[str, Any]:
+    if not property_id:
+        return payload
+    out = copy.deepcopy(payload)
+    props = out.get("portfolioProperties") or []
+    if isinstance(props, list):
+        out["portfolioProperties"] = [p for p in props if isinstance(p, dict) and str(p.get("id")) == property_id]
+    return out
+
+
+def _filter_onboarding_sync(payload: dict[str, Any], property_id: str | None) -> dict[str, Any]:
+    if not property_id:
+        return payload
+    out = copy.deepcopy(payload)
+    plist = out.get("properties") or []
+    if not isinstance(plist, list):
+        return out
+    filt = [p for p in plist if isinstance(p, dict) and str(p.get("id")) == property_id]
+    out["properties"] = filt
+    if filt:
+        nv = len(filt)
+        avg_c = int(sum(int(p.get("completeness") or 0) for p in filt) / max(1, nv))
+        out["metricCards"] = [
+            {"id": "ready", "value": str(sum(1 for p in filt if p.get("status") == "ready")), "label": "Ready"},
             {
-                "id": str(p["id"]),
-                "name": p.get("name", f"Property {i}"),
-                "status": status,
-                "completeness": completeness,
-                "alerts": []
-                if status == "ready"
-                else ["Missing CRM token", "Floorplan media pending"][: (2 if i % 2 else 1)],
-                "lastUpdated": _iso_now_minus(i),
-                "checklist": [
-                    {"label": "Property profile", "percent": min(100, completeness + 10)},
-                    {"label": "Inventory sync", "percent": max(20, completeness - 20)},
-                    {"label": "Messaging setup", "percent": max(10, completeness - 30)},
-                ],
-                "blockers": [] if status != "blocked" else ["Awaiting legal checklist approval"],
-            }
-        )
-
-    return {
-        "page": {"title": "Property Onboarding", "description": "Activation progress and blockers"},
-        "metricCards": [
-            {"id": "ready", "value": str(sum(1 for p in data if p["status"] == "ready")), "label": "Ready"},
-            {"id": "inProgress", "value": str(sum(1 for p in data if p["status"] == "inProgress")), "label": "In Progress"},
-            {"id": "blocked", "value": str(sum(1 for p in data if p["status"] == "blocked")), "label": "Blocked"},
-            {"id": "avg", "value": f"{int(sum(p['completeness'] for p in data) / max(1, len(data)))}%", "label": "Avg Completeness"},
-        ],
-        "listTitle": "Properties",
-        "emptyStateText": "No properties available",
-        "properties": data,
-    }
+                "id": "inProgress",
+                "value": str(sum(1 for p in filt if p.get("status") == "inProgress")),
+                "label": "In Progress",
+            },
+            {"id": "blocked", "value": str(sum(1 for p in filt if p.get("status") == "blocked")), "label": "Blocked"},
+            {"id": "avg", "value": f"{avg_c}%", "label": "Avg Completeness"},
+        ]
+    else:
+        out["metricCards"] = [
+            {"id": "ready", "value": "0", "label": "Ready"},
+            {"id": "inProgress", "value": "0", "label": "In Progress"},
+            {"id": "blocked", "value": "0", "label": "Blocked"},
+            {"id": "avg", "value": "0%", "label": "Avg Completeness"},
+        ]
+    return out
 
 
-async def get_portfolio_overview_payload() -> dict[str, Any]:
-    properties = await _aselect("properties", "id,name,address", 60)
-    cards = []
-    for i, p in enumerate(properties[:30], start=1):
-        cards.append(
-            {
-                "name": p.get("name", f"Property {i}"),
-                "locationLine": "Urban District",
-                "status": "healthy" if i % 4 else "watch",
-                "health": 65 + (i % 30),
-                "conversion": f"{12 + (i % 12)}%",
-                "vacancy": str(6 + (i % 10)),
-                "tours": str(20 + i),
-                "insight": "Tour volume rising but app conversion lags.",
-                "insightAlert": i % 5 == 0,
-                "stressMetrics": [{"label": "Lead Volume", "value": "medium"}, {"label": "Tour-to-app", "value": "watch"}],
-            }
-        )
+async def get_property_options_payload() -> list[dict[str, str]]:
+    return await asyncio.to_thread(_list_property_options_sync)
 
-    return {
-        "page": {"title": "Portfolio Overview", "description": "Portfolio-level KPIs"},
-        "metricCards": [
-            {"value": "92%", "label": "Occupancy", "footerKind": "positive", "footerText": "+1.2% WoW"},
-            {"value": "18%", "label": "Tour to App", "footerKind": "neutral", "footerText": "Flat WoW"},
-            {"value": "11d", "label": "Avg Vacancy Days", "footerKind": "negative", "footerText": "+0.9d WoW"},
-        ],
-        "portfolioProperties": cards,
-        "recommendationsSectionTitle": "AI Recommendations",
-        "recommendations": [
-            {
-                "icon": "sparkles",
-                "title": f"Recommendation {i}",
-                "description": "Adjust pricing and outreach cadence for underperforming segment.",
-                "tags": ["leasing", "priority-high" if i % 3 == 0 else "priority-medium"],
-                "action": "View details",
-                "actionVariant": "primary",
-            }
-            for i in range(1, 21)
-        ],
-    }
+
+async def get_home_payload(property_id: str | None = None, days: int = 7) -> dict[str, Any]:
+    _ = normalize_dashboard_days(days)
+    base = await _aget_payload("dashboard_home")
+    if not property_id:
+        return base
+    return await asyncio.to_thread(_filter_home_payload_sync, base, property_id)
+
+
+async def get_leads_summary_payload(property_id: str | None = None, days: int = 7) -> dict[str, Any]:
+    d = normalize_dashboard_days(days)
+    return await asyncio.to_thread(_build_leads_summary_sync, property_id, d)
+
+
+async def get_inventory_payload(property_id: str | None = None, days: int = 7) -> dict[str, Any]:
+    d = normalize_dashboard_days(days)
+    return await asyncio.to_thread(_build_inventory_vacant_sync, property_id, d)
+
+
+async def get_property_onboarding_payload(property_id: str | None = None, days: int = 7) -> dict[str, Any]:
+    _ = normalize_dashboard_days(days)
+    base = await _aget_payload("properties_onboarding")
+    if not property_id:
+        return base
+    return await asyncio.to_thread(_filter_onboarding_sync, base, property_id)
+
+
+async def get_portfolio_overview_payload(property_id: str | None = None, days: int = 7) -> dict[str, Any]:
+    _ = normalize_dashboard_days(days)
+    base = await _aget_payload("portfolio_overview")
+    if not property_id:
+        return base
+    return await asyncio.to_thread(_filter_portfolio_sync, base, property_id)
 
 
 async def get_weekly_brief_payload() -> dict[str, Any]:
-    return {
-        "page": {"title": "Weekly Operator Brief"},
-        "briefWeekLabel": "Week of Apr 9, 2026",
-        "executiveSummary": {
-            "paragraphs": [
-                "Portfolio traffic remained strong while conversion stabilized.",
-                "Primary headwind is pricing sensitivity in high-vacancy clusters.",
-            ]
-        },
-        "wins": {"items": [f"Win {i}: occupancy lift at selected assets" for i in range(1, 21)]},
-        "blockers": {"items": [f"Blocker {i}: integration lag impacts sync windows" for i in range(1, 21)]},
-        "objections": {"items": [{"topic": f"Objection Topic {i}", "mentions": 3 + i} for i in range(1, 21)]},
-        "nextActions": {"items": [{"n": i, "title": f"Action {i}", "subtitle": "Owner: Ops team"} for i in range(1, 21)]},
-    }
+    return await _aget_payload("briefs_weekly")
 
 
 async def get_integrations_payload() -> dict[str, Any]:
-    return {
-        "summaryStrip": [
-            {"label": "Connected", "display": "16"},
-            {"label": "Needs Attention", "display": "4"},
-            {"label": "Realtime Sync", "display": "10"},
-        ],
-        "page": {"title": "Integrations", "description": "Connection health across systems"},
-        "filterOptions": ["All", "CRM", "PMS", "Comms", "Analytics"],
-        "rateLimitBanner": {
-            "title": "Rate-limit advisory",
-            "description": "Some providers may delay refresh during peak windows.",
-        },
-        "integrations": [
-            {
-                "id": f"int-{i}",
-                "name": f"Integration {i}",
-                "category": ["CRM", "PMS", "Comms", "Analytics"][i % 4],
-                "description": "Bi-directional sync for leasing workflows.",
-                "connected": i % 5 != 0,
-                "lastSync": _iso_now_minus(i),
-                "syncRealtime": i % 3 != 0,
-                "icon": "plug",
-                "iconBg": "#F3F4F6",
-                "iconColor": "#111827",
-            }
-            for i in range(1, 21)
-        ],
-    }
+    return await _aget_payload("integrations")
 
 
 async def get_profile_payload() -> dict[str, Any]:
-    return {
-        "title": "Profile",
-        "description": "User profile and preferences",
-    }
+    return await _aget_payload("profile_summary")
 
 
 async def get_header_payload() -> dict[str, Any]:
-    return {
-        "brand": {
-            "name": "Aigentless",
-            "logoSrc": "/logo.png",
-            "homeAriaLabel": "Aigentless home",
-        },
-        "propertySelectorLabel": "All Properties",
-        "dateRangeLabel": "Last 7 days",
-        "search": {"placeholder": "Search...", "inputId": "global-search"},
-    }
+    return await _aget_payload("ui_header")
 
 
 async def get_navigation_payload() -> dict[str, Any]:
-    return {
-        "main": [
-            {"to": "/", "end": True, "tooltip": "Home", "icon": "Home"},
-            {"to": "/users", "end": False, "tooltip": "Pipeline", "icon": "Users"},
-            {"to": "/packages", "end": False, "tooltip": "Inventory", "icon": "Package"},
-            {"to": "/properties", "end": False, "tooltip": "Properties", "icon": "Building2"},
-            {"to": "/analytics", "end": False, "tooltip": "Portfolio", "icon": "BarChart3"},
-            {"to": "/ai", "end": False, "tooltip": "Lesa AI", "icon": "Sparkles"},
-            {"to": "/settings", "end": False, "tooltip": "Settings", "icon": "Settings"},
-        ],
-        "profileFooter": {"to": "/profile", "tooltip": "User profile", "icon": "User"},
-    }
+    return await _aget_payload("ui_navigation")
