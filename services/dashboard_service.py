@@ -1,5 +1,5 @@
 """
-Live dashboard payloads from Supabase tables (no ui_payloads for leads/inventory).
+Live dashboard payloads from Supabase tables (no ui_payloads).
 
 Lead Prioritization (/api/leads/summary):
   prospects -> prospect_events (prospect_id), properties (property_id),
@@ -10,28 +10,11 @@ Inventory (/api/inventory/vacant-units):
   tour_steps (unit_id), bookings (floorplan_id, applications proxy).
 """
 import asyncio
-import copy
 from collections import Counter, defaultdict
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from config.database import get_client
-
-
-def _fetch_payload(key: str) -> dict[str, Any]:
-    res = get_client().table("ui_payloads").select("payload").eq("key", key).limit(1).execute()
-    data = res.data or []
-    if not data:
-        raise RuntimeError(f"Missing UI payload in DB for key: {key}")
-    payload = data[0].get("payload")
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"Invalid payload format for key: {key}")
-    return payload
-
-
-async def _aget_payload(key: str) -> dict[str, Any]:
-    return await asyncio.to_thread(_fetch_payload, key)
-
 
 _IN_CHUNK = 12
 
@@ -354,20 +337,42 @@ def _days_vacant(available_date: Any, fallback: datetime | None) -> int:
 
 
 def _conversion_rate_pct(tours: int, apps: int) -> float:
-    """Share of applications in (tours + apps), matches UI when tours=0 and apps>0."""
-    total = tours + apps
-    if total <= 0:
+    """Conversion = applications / tours, capped to 100% and safe for tours=0."""
+    if tours <= 0:
         return 0.0
-    return (apps / total) * 100.0
+    return min(100.0, (apps / tours) * 100.0)
 
 
 def _inventory_status_from_conversion(conv_pct: float) -> str:
-    """healthy: >90%; stale: 60–90%; atRisk: <60%."""
+    """healthy: >90%; stale (moderate): 60–90%; atRisk (critical): <60%."""
     if conv_pct > 90:
         return "healthy"
     if conv_pct >= 60:
         return "stale"
     return "atRisk"
+
+
+def _space_is_vacant_for_inventory(status_val: Any) -> bool:
+    """Match common PMS / migration values; seed used lowercase 'available' only."""
+    raw = str(status_val or "").strip().lower().replace(" ", "_")
+    if not raw:
+        return False
+    if raw in (
+        "available",
+        "vacant",
+        "unoccupied",
+        "open",
+        "listed",
+        "vacant_ready",
+        "vacant-ready",
+        "move_in_ready",
+        "move-in-ready",
+    ):
+        return True
+    # e.g. "notice" (on notice) is not yet vacant — exclude unless clearly available
+    if "unavail" in raw or raw in ("leased", "occupied", "notice"):
+        return False
+    return False
 
 
 def _tour_steps_counts_by_unit(client: Any, unit_ids: list[str]) -> Counter[str]:
@@ -435,11 +440,11 @@ def _build_inventory_vacant_sync(property_id: str | None = None, days: int = 7) 
     sp = (
         client.table("spaces")
         .select("unit_id,available_date,availability_status,created_at")
-        .eq("availability_status", "available")
-        .limit(100)
+        .limit(400)
         .execute()
     )
-    spaces_list = sp.data or []
+    spaces_list = [s for s in (sp.data or []) if _space_is_vacant_for_inventory(s.get("availability_status"))]
+    spaces_list = spaces_list[:120]
     if not spaces_list:
         return {
             "page": {"title": "Inventory Intelligence", "description": "Vacancy and conversion health"},
@@ -508,10 +513,12 @@ def _build_inventory_vacant_sync(property_id: str | None = None, days: int = 7) 
             pname = prop_names.get(pid, "Property")
             fp = str(u.get("floorplan_id") or "")
             avail = sp_row.get("available_date")
-            created_u = _parse_ts(u.get("created_at"))
-            vacancy_days = _days_vacant(avail, created_u)
+            fallback_dt = _parse_ts(sp_row.get("created_at")) or _parse_ts(u.get("move_in_date")) or _parse_ts(u.get("created_at"))
+            vacancy_days = _days_vacant(avail, fallback_dt)
             tours_n = tour_counts.get(uid, 0)
-            apps_n = app_counts.get(fp, 0) if fp else 0
+            raw_apps = app_counts.get(fp, 0) if fp else 0
+            # Bookings are floorplan-level in this schema; keep unit rows internally consistent.
+            apps_n = min(raw_apps, tours_n)
             conv_float = _conversion_rate_pct(tours_n, apps_n)
             conv_pct_int = int(round(conv_float))
             status = _inventory_status_from_conversion(conv_float)
@@ -521,6 +528,7 @@ def _build_inventory_vacant_sync(property_id: str | None = None, days: int = 7) 
             vacant_units.append(
                 {
                     "id": uid,
+                    "propertyId": pid,
                     "unitCode": u.get("unit") or uid[:8],
                     "property": pname,
                     "unitType": utype,
@@ -565,93 +573,15 @@ def _list_property_options_sync() -> list[dict[str, str]]:
     return [{"id": str(x["id"]), "name": (x.get("name") or "Property").strip()} for x in (r.data or [])]
 
 
-def _filter_home_payload_sync(payload: dict[str, Any], property_id: str | None) -> dict[str, Any]:
-    if not property_id:
-        return payload
-    client = get_client()
-    pr = client.table("properties").select("name").eq("id", property_id).limit(1).execute()
-    if not pr.data:
-        return payload
-    pname = (pr.data[0].get("name") or "").strip()
-    if not pname:
-        return payload
-    out = copy.deepcopy(payload)
-    for key, sk in [
-        ("atRiskUnits", "items"),
-        ("launchBlockers", "items"),
-        ("followUpQueue", "items"),
-        ("tourInsights", "items"),
-    ]:
-        block = out.get(key)
-        if not isinstance(block, dict):
-            continue
-        items = block.get(sk) or []
-        if not isinstance(items, list):
-            continue
-        filtered = [
-            x
-            for x in items
-            if isinstance(x, dict)
-            and ((str(x.get("property") or "").strip() == pname) or (str(x.get("name") or "").strip() == pname))
-        ]
-        block[sk] = filtered
-        if key in ("atRiskUnits", "launchBlockers", "followUpQueue"):
-            block["summaryValue"] = str(len(filtered))
-    return out
-
-
-def _filter_portfolio_sync(payload: dict[str, Any], property_id: str | None) -> dict[str, Any]:
-    if not property_id:
-        return payload
-    out = copy.deepcopy(payload)
-    props = out.get("portfolioProperties") or []
-    if isinstance(props, list):
-        out["portfolioProperties"] = [p for p in props if isinstance(p, dict) and str(p.get("id")) == property_id]
-    return out
-
-
-def _filter_onboarding_sync(payload: dict[str, Any], property_id: str | None) -> dict[str, Any]:
-    if not property_id:
-        return payload
-    out = copy.deepcopy(payload)
-    plist = out.get("properties") or []
-    if not isinstance(plist, list):
-        return out
-    filt = [p for p in plist if isinstance(p, dict) and str(p.get("id")) == property_id]
-    out["properties"] = filt
-    if filt:
-        nv = len(filt)
-        avg_c = int(sum(int(p.get("completeness") or 0) for p in filt) / max(1, nv))
-        out["metricCards"] = [
-            {"id": "ready", "value": str(sum(1 for p in filt if p.get("status") == "ready")), "label": "Ready"},
-            {
-                "id": "inProgress",
-                "value": str(sum(1 for p in filt if p.get("status") == "inProgress")),
-                "label": "In Progress",
-            },
-            {"id": "blocked", "value": str(sum(1 for p in filt if p.get("status") == "blocked")), "label": "Blocked"},
-            {"id": "avg", "value": f"{avg_c}%", "label": "Avg Completeness"},
-        ]
-    else:
-        out["metricCards"] = [
-            {"id": "ready", "value": "0", "label": "Ready"},
-            {"id": "inProgress", "value": "0", "label": "In Progress"},
-            {"id": "blocked", "value": "0", "label": "Blocked"},
-            {"id": "avg", "value": "0%", "label": "Avg Completeness"},
-        ]
-    return out
-
-
 async def get_property_options_payload() -> list[dict[str, str]]:
     return await asyncio.to_thread(_list_property_options_sync)
 
 
 async def get_home_payload(property_id: str | None = None, days: int = 7) -> dict[str, Any]:
-    _ = normalize_dashboard_days(days)
-    base = await _aget_payload("dashboard_home")
-    if not property_id:
-        return base
-    return await asyncio.to_thread(_filter_home_payload_sync, base, property_id)
+    from services.live_ui_payloads import build_home_payload
+
+    d = normalize_dashboard_days(days)
+    return await asyncio.to_thread(build_home_payload, property_id, d)
 
 
 async def get_leads_summary_payload(property_id: str | None = None, days: int = 7) -> dict[str, Any]:
@@ -665,36 +595,44 @@ async def get_inventory_payload(property_id: str | None = None, days: int = 7) -
 
 
 async def get_property_onboarding_payload(property_id: str | None = None, days: int = 7) -> dict[str, Any]:
-    _ = normalize_dashboard_days(days)
-    base = await _aget_payload("properties_onboarding")
-    if not property_id:
-        return base
-    return await asyncio.to_thread(_filter_onboarding_sync, base, property_id)
+    from services.live_ui_payloads import build_onboarding_payload
+
+    d = normalize_dashboard_days(days)
+    return await asyncio.to_thread(build_onboarding_payload, property_id, d)
 
 
 async def get_portfolio_overview_payload(property_id: str | None = None, days: int = 7) -> dict[str, Any]:
-    _ = normalize_dashboard_days(days)
-    base = await _aget_payload("portfolio_overview")
-    if not property_id:
-        return base
-    return await asyncio.to_thread(_filter_portfolio_sync, base, property_id)
+    from services.live_ui_payloads import build_portfolio_overview
+
+    d = normalize_dashboard_days(days)
+    return await asyncio.to_thread(build_portfolio_overview, property_id, d)
 
 
 async def get_weekly_brief_payload() -> dict[str, Any]:
-    return await _aget_payload("briefs_weekly")
+    from services.live_ui_payloads import build_weekly_brief
+
+    return await asyncio.to_thread(build_weekly_brief)
 
 
 async def get_integrations_payload() -> dict[str, Any]:
-    return await _aget_payload("integrations")
+    from services.live_ui_payloads import build_integrations_payload
+
+    return await asyncio.to_thread(build_integrations_payload)
 
 
 async def get_profile_payload() -> dict[str, Any]:
-    return await _aget_payload("profile_summary")
+    from services.live_ui_payloads import build_profile_payload
+
+    return await asyncio.to_thread(build_profile_payload)
 
 
 async def get_header_payload() -> dict[str, Any]:
-    return await _aget_payload("ui_header")
+    from services.live_ui_payloads import build_header_payload
+
+    return await asyncio.to_thread(build_header_payload)
 
 
 async def get_navigation_payload() -> dict[str, Any]:
-    return await _aget_payload("ui_navigation")
+    from services.live_ui_payloads import build_navigation_payload
+
+    return await asyncio.to_thread(build_navigation_payload)
