@@ -6,6 +6,7 @@ from fastapi.responses import RedirectResponse
 from fastapi_standalone_docs import StandaloneDocs
 
 from config.database import close_db, db_is_ready, startup_database
+from routes.chatbot_routes import router as chatbot_router
 from routes.dashboard_routes import router as dashboard_router
 from routes.property_routes import router as property_router
 
@@ -29,6 +30,7 @@ app.add_middleware(
 StandaloneDocs(app=app)
 app.include_router(dashboard_router, prefix="/api", tags=["Dashboard APIs"])
 app.include_router(property_router, prefix="/properties", tags=["Properties"])
+app.include_router(chatbot_router, prefix="/api", tags=["Chatbot"])
 
 
 @app.get("/", include_in_schema=False)
