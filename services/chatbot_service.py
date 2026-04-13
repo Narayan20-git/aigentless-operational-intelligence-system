@@ -1,11 +1,11 @@
 """
-chatbot_service.py — Google ADK + OpenAI powered chatbot for Aigentless dashboard.
+chatbot_service.py — Google ADK + OpenAI (gpt-4.1-mini) chatbot for Aigentless.
 
 Architecture:
   - Google ADK (LlmAgent + Runner + InMemorySessionService) handles the agent loop
-  - LiteLlm bridges ADK to OpenAI models (gpt-4.1-mini etc.)
+  - LiteLlm bridges ADK to OpenAI's gpt-4.1-mini
   - FunctionTool wraps each Supabase query function
-  - OPENAI_API_KEY is read from environment
+  - OPENAI_API_KEY is read from .env
 
 Design principles:
   - All answers strictly from live Supabase data via tools (no hallucination)
@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
 
 from google.adk.agents import LlmAgent
 from google.adk.models.lite_llm import LiteLlm
@@ -36,15 +35,7 @@ logger = logging.getLogger(__name__)
 
 OUT_OF_SCOPE_REPLY = "I don't have an answer to that."
 APP_NAME = "aigentless_chatbot"
-
-# ADK uses LiteLlm prefix "openai/" to route to OpenAI API
-# Model preference — first supported model wins
-_MODEL_PREFERENCE = [
-    "openai/gpt-4.1-mini",
-    "openai/gpt-4o-mini",
-    "openai/gpt-4.1",
-    "openai/gpt-4o",
-]
+MODEL = "openai/gpt-4.1-mini"  # LiteLlm prefix "openai/" routes to OpenAI API
 
 _SYSTEM_PROMPT = """You are the AI Assistant embedded in the Aigentless property management dashboard.
 
@@ -78,12 +69,11 @@ Every number, unit name, and property name in your answer MUST come from a tool 
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ADK setup — built once, reused across requests
+# ADK setup — built once, reused across all requests
 # ─────────────────────────────────────────────────────────────────────────────
 
 _session_service: InMemorySessionService | None = None
 _runner: Runner | None = None
-_current_model: str | None = None
 
 
 def _get_openai_api_key() -> str:
@@ -96,71 +86,44 @@ def _get_openai_api_key() -> str:
     return key
 
 
-def _build_runner(model_name: str) -> tuple[Runner, InMemorySessionService]:
-    """Build ADK Runner using LiteLlm to connect to OpenAI."""
-
-    # LiteLlm reads OPENAI_API_KEY from environment automatically
-    os.environ["OPENAI_API_KEY"] = _get_openai_api_key()
-
-    # Wrap each Supabase tool with ADK FunctionTool
-    adk_tools = [FunctionTool(fn) for fn in ALL_TOOL_FUNCTIONS]
-
-    # LiteLlm bridges ADK → OpenAI. Model string must have "openai/" prefix.
-    llm = LiteLlm(model=model_name)
-
-    agent = LlmAgent(
-        name="aigentless_assistant",
-        model=llm,
-        instruction=_SYSTEM_PROMPT,
-        tools=adk_tools,
-    )
-
-    session_service = InMemorySessionService()
-
-    runner = Runner(
-        agent=agent,
-        app_name=APP_NAME,
-        session_service=session_service,
-    )
-
-    return runner, session_service
-
-
 def _get_runner() -> tuple[Runner, InMemorySessionService]:
-    """Return cached runner or build a new one."""
-    global _runner, _session_service, _current_model
+    """Return cached runner or build it once on first call."""
+    global _runner, _session_service
 
     if _runner is not None and _session_service is not None:
         return _runner, _session_service
 
-    last_error: Exception | None = None
-    for model_name in _MODEL_PREFERENCE:
-        try:
-            logger.info("[Chatbot ADK+OpenAI] Building runner with model: %s", model_name)
-            runner, session_svc = _build_runner(model_name)
-            _runner = runner
-            _session_service = session_svc
-            _current_model = model_name
-            logger.info("[Chatbot ADK+OpenAI] Runner ready with model: %s", model_name)
-            return _runner, _session_service
-        except Exception as e:
-            logger.warning(
-                "[Chatbot ADK+OpenAI] Model %s failed to init: %s", model_name, e
-            )
-            last_error = e
-            continue
+    # Set API key for LiteLlm (reads OPENAI_API_KEY from environment)
+    os.environ["OPENAI_API_KEY"] = _get_openai_api_key()
 
-    raise RuntimeError(
-        f"Could not initialise ADK+OpenAI runner. Last error: {last_error}"
+    logger.info("[Chatbot] Building ADK runner with model: %s", MODEL)
+
+    adk_tools = [FunctionTool(fn) for fn in ALL_TOOL_FUNCTIONS]
+
+    agent = LlmAgent(
+        name="aigentless_assistant",
+        model=LiteLlm(model=MODEL),
+        instruction=_SYSTEM_PROMPT,
+        tools=adk_tools,
     )
+
+    _session_service = InMemorySessionService()
+
+    _runner = Runner(
+        agent=agent,
+        app_name=APP_NAME,
+        session_service=_session_service,
+    )
+
+    logger.info("[Chatbot] Runner ready — model: %s", MODEL)
+    return _runner, _session_service
 
 
 def _reset_runner() -> None:
-    """Clear cached runner — next call will rebuild with next model."""
-    global _runner, _session_service, _current_model
+    """Reset runner on error so it rebuilds on next request."""
+    global _runner, _session_service
     _runner = None
     _session_service = None
-    _current_model = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -173,7 +136,7 @@ async def run_chatbot(
     user_id: str = "user",
 ) -> str:
     """
-    Run a single chatbot turn using Google ADK with OpenAI backend.
+    Run a single chatbot turn using Google ADK with OpenAI gpt-4.1-mini.
 
     Args:
         user_message: The user's message.
@@ -186,97 +149,75 @@ async def run_chatbot(
     try:
         _get_openai_api_key()
     except RuntimeError as e:
-        logger.error("[Chatbot ADK+OpenAI] %s", e)
+        logger.error("[Chatbot] %s", e)
         return OUT_OF_SCOPE_REPLY
 
-    for attempt in range(2):
-        try:
-            runner, session_svc = _get_runner()
+    try:
+        runner, session_svc = _get_runner()
 
-            # Ensure session exists — all session methods are async
-            existing = await session_svc.get_session(
+        # Create session if it doesn't exist (all session methods are async)
+        existing = await session_svc.get_session(
+            app_name=APP_NAME,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        if existing is None:
+            await session_svc.create_session(
                 app_name=APP_NAME,
                 user_id=user_id,
                 session_id=session_id,
             )
-            if existing is None:
-                await session_svc.create_session(
-                    app_name=APP_NAME,
-                    user_id=user_id,
-                    session_id=session_id,
-                )
-                logger.info(
-                    "[Chatbot ADK+OpenAI] Created session %s for user %s",
-                    session_id, user_id,
-                )
+            logger.info("[Chatbot] Created session %s for user %s", session_id, user_id)
 
-            new_message = genai_types.Content(
-                role="user",
-                parts=[genai_types.Part(text=user_message)],
+        new_message = genai_types.Content(
+            role="user",
+            parts=[genai_types.Part(text=user_message)],
+        )
+
+        # Run the ADK agent loop and collect final response
+        reply_parts: list[str] = []
+        async for event in runner.run_async(
+            user_id=user_id,
+            session_id=session_id,
+            new_message=new_message,
+        ):
+            if event.is_final_response():
+                if event.content and event.content.parts:
+                    for part in event.content.parts:
+                        if part.text:
+                            reply_parts.append(part.text)
+
+        reply = " ".join(reply_parts).strip()
+        if reply:
+            logger.info("[Chatbot] Reply generated successfully")
+            return reply
+
+        logger.warning("[Chatbot] Empty reply from agent")
+        return OUT_OF_SCOPE_REPLY
+
+    except Exception as exc:
+        err_str = str(exc)
+
+        if "429" in err_str or "rate_limit" in err_str.lower():
+            logger.warning("[Chatbot] Rate limit hit: %s", err_str[:150])
+            return "Too many requests. Please wait a moment and try again."
+
+        if "insufficient_quota" in err_str.lower() or "quota" in err_str.lower():
+            logger.error("[Chatbot] OpenAI quota exceeded: %s", err_str[:150])
+            return (
+                "OpenAI API quota exceeded. "
+                "Please check https://platform.openai.com/usage"
             )
 
-            # Run the ADK agent loop and collect final response
-            reply_parts: list[str] = []
-            async for event in runner.run_async(
-                user_id=user_id,
-                session_id=session_id,
-                new_message=new_message,
-            ):
-                if event.is_final_response():
-                    if event.content and event.content.parts:
-                        for part in event.content.parts:
-                            if part.text:
-                                reply_parts.append(part.text)
+        if "401" in err_str or "invalid_api_key" in err_str.lower():
+            logger.error("[Chatbot] Invalid OpenAI API key")
+            _reset_runner()
+            return "Invalid API key. Please check OPENAI_API_KEY in your .env file."
 
-            reply = " ".join(reply_parts).strip()
-            if reply:
-                logger.info(
-                    "[Chatbot ADK+OpenAI] Reply generated (model: %s)",
-                    _current_model,
-                )
-                return reply
+        if "503" in err_str or "502" in err_str:
+            logger.warning("[Chatbot] OpenAI service temporarily unavailable")
+            _reset_runner()
+            return "OpenAI service is temporarily unavailable. Please try again shortly."
 
-            logger.warning("[Chatbot ADK+OpenAI] Empty reply from agent")
-            return OUT_OF_SCOPE_REPLY
-
-        except Exception as exc:
-            err_str = str(exc)
-
-            is_quota = (
-                "429" in err_str
-                or "quota" in err_str.lower()
-                or "rate_limit" in err_str.lower()
-                or "insufficient_quota" in err_str.lower()
-            )
-            is_model = (
-                "404" in err_str
-                or "model_not_found" in err_str.lower()
-                or "does not exist" in err_str.lower()
-                or "not supported" in err_str.lower()
-            )
-            is_server = (
-                "503" in err_str
-                or "502" in err_str
-                or "unavailable" in err_str.lower()
-            )
-
-            if (is_model or is_server) and attempt == 0:
-                logger.warning(
-                    "[Chatbot ADK+OpenAI] Resetting runner: %s", err_str[:150]
-                )
-                _reset_runner()
-                continue
-
-            if is_quota:
-                logger.error(
-                    "[Chatbot ADK+OpenAI] OpenAI quota/rate limit: %s", err_str[:150]
-                )
-                return (
-                    "OpenAI API quota or rate limit reached. "
-                    "Please check https://platform.openai.com/usage or try again shortly."
-                )
-
-            logger.exception("[Chatbot ADK+OpenAI] Unexpected error: %s", exc)
-            return OUT_OF_SCOPE_REPLY
-
-    return OUT_OF_SCOPE_REPLY
+        logger.exception("[Chatbot] Unexpected error: %s", exc)
+        return OUT_OF_SCOPE_REPLY
