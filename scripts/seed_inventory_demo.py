@@ -319,6 +319,36 @@ def _seed(client, rows: list[dict]) -> None:
                 }
             ).execute()
 
+        # Extra applications in the 8–30d and 31–90d windows so inventory conversion differs by ?days=.
+        if apps_n > 0:
+            for extra_days in (22, 58):
+                st = now - timedelta(days=extra_days, hours=abs(hash(str(uid))) % 12)
+                end = st + timedelta(minutes=45)
+                bid = str(uuid.uuid4())
+                prof = str(uuid.uuid4())
+                client.table("bookings").insert(
+                    {
+                        "id": bid,
+                        "floorplan_id": fp,
+                        "start_time": st.isoformat(),
+                        "end_time": end.isoformat(),
+                        "profile_id": prof,
+                        "string_profile_id": prof,
+                        "phone": "+15550002222",
+                        "name": f"Applicant {code}-hist-{extra_days}d",
+                        "pin": {},
+                        "qr_code": {},
+                        "stratis_meta": {"source": "seed", "window": "historical"},
+                        "completion_state": {"state": "completed"},
+                        "utm_source": "seed",
+                        "utm_medium": "demo",
+                        "utm_campaign": "inventory",
+                        "utm_content": code,
+                        "utm_term": "lease",
+                        "status": "booked",
+                    }
+                ).execute()
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Seed legacy inventory demo into Supabase")

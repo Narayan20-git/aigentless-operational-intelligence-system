@@ -1,6 +1,7 @@
 import asyncio
 import os
 import json
+from datetime import UTC, datetime, timedelta
 from typing import Any, Optional
 
 from config.database import get_client
@@ -15,7 +16,23 @@ async def list_properties() -> list[dict[str, Any]]:
     return await asyncio.to_thread(_fetch_properties)
 
 
-def _fetch_onboarding_summary(property_id: Optional[str] = None) -> dict[str, Any]:
+def _count_prospect_events_in_window(property_id: Optional[str], days: int) -> int:
+    from services.dashboard_service import normalize_dashboard_days
+
+    d = normalize_dashboard_days(days)
+    since = (datetime.now(UTC) - timedelta(days=d)).isoformat()
+    client = get_client()
+    try:
+        q = client.table("prospect_events").select("id", count="exact").gte("timestamp", since)
+        if property_id:
+            q = q.eq("property_id", property_id)
+        r = q.limit(1).execute()
+        return int(r.count or 0)
+    except Exception:
+        return 0
+
+
+def _fetch_onboarding_summary(property_id: Optional[str] = None, days: int = 7) -> dict[str, Any]:
     query = get_client().table("property_onboarding_status").select("*")
     if property_id:
         query = query.eq("property_id", property_id)
@@ -27,6 +44,7 @@ def _fetch_onboarding_summary(property_id: Optional[str] = None) -> dict[str, An
     in_progress = sum(1 for r in rows if r.get("status") == "in-progress")
     blocked     = sum(1 for r in rows if r.get("status") == "blocked")
     avg_pct     = round(sum(r.get("overall_completeness", 0) for r in rows) / len(rows)) if rows else 0
+    events_n = _count_prospect_events_in_window(property_id, days)
 
     return {
         "ready_to_launch":    ready,
@@ -34,11 +52,16 @@ def _fetch_onboarding_summary(property_id: Optional[str] = None) -> dict[str, An
         "blocked":            blocked,
         "avg_completeness":   avg_pct,
         "total_properties":   len(rows),
+        "prospect_events_in_window": events_n,
+        "days":               days,
     }
 
 
-async def get_onboarding_summary(property_id: Optional[str] = None) -> dict[str, Any]:
-    return await asyncio.to_thread(_fetch_onboarding_summary, property_id)
+async def get_onboarding_summary(property_id: Optional[str] = None, days: int = 7) -> dict[str, Any]:
+    from services.dashboard_service import normalize_dashboard_days
+
+    d = normalize_dashboard_days(days)
+    return await asyncio.to_thread(_fetch_onboarding_summary, property_id, d)
 
 
 def _fetch_onboarding_properties(property_id: Optional[str] = None, status: Optional[str] = None) -> dict[str, Any]:

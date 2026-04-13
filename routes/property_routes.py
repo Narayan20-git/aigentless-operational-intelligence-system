@@ -50,13 +50,16 @@ async def list_all():
 
 
 @router.get("/onboarding/summary", response_model=dict[str, Any])
-async def get_onboarding_summary_route(property_id: Optional[str] = Query(None)):
+async def get_onboarding_summary_route(
+    property_id: Optional[str] = Query(None),
+    days: int = Query(7, description="Rolling window for lead activity count (7, 30, or 90)"),
+):
     """
-    Powers the 4 KPI cards at the top of the screen:
-    Ready to launch | In progress | Blocked | Avg. completeness
-    Optional ?property_id filter for the dropdown
+    Powers KPI cards at the top of the screen:
+    Ready to launch | In progress | Blocked | Avg. completeness | prospect_events_in_window
+    Optional ?property_id filter for the dropdown; ?days= for the activity window.
     """
-    return await get_onboarding_summary(property_id)
+    return await get_onboarding_summary(property_id, days=days)
 
 
 @router.get("/onboarding", response_model=dict[str, Any])

@@ -1,6 +1,6 @@
 """
 Pipe-delimited rows: unit_id|property_id|unit_code|property_name|unit_type|vacancy_days|apps
-(tours are always 5 in the reference API; apps drives conversion.)
+The parser applies a deterministic adjustment so seeded app volume has a realistic spread.
 """
 
 INVENTORY_DEMO_PIPE = """
@@ -46,6 +46,20 @@ def parse_demo_rows():
         parts = line.split("|")
         uid, pid, code, pname, utype, days_s, apps_s = parts
         br = utype.split()[0] if utype else "1"
+        base_apps = int(apps_s)
+        vacancy_days = int(days_s)
+        unit_seed = abs(hash(uid.strip())) % 5
+        # Realistic pattern: newer vacancies trend more activity; older ones taper off,
+        # with deterministic variance so not every unit in the same bucket looks identical.
+        if vacancy_days <= 10:
+            adjusted_apps = base_apps + 2 + (unit_seed % 2)
+        elif vacancy_days <= 20:
+            adjusted_apps = base_apps + 1
+        elif vacancy_days <= 30:
+            adjusted_apps = max(1, base_apps)
+        else:
+            adjusted_apps = max(0, base_apps - 1 - (unit_seed % 2))
+
         rows.append(
             {
                 "unit_id": uid.strip(),
@@ -53,8 +67,8 @@ def parse_demo_rows():
                 "unit_code": code.strip(),
                 "property_name": pname.strip(),
                 "bedrooms": br,
-                "vacancy_days": int(days_s),
-                "apps": int(apps_s),
+                "vacancy_days": vacancy_days,
+                "apps": adjusted_apps,
                 "tours": 5,
             }
         )

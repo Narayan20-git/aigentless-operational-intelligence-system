@@ -78,8 +78,8 @@ async def portfolio_overview(
 
 
 @router.get("/briefs/weekly")
-async def briefs_weekly():
-    return await get_weekly_brief_payload()
+async def briefs_weekly(days: int = Query(7, description="Rolling window in days (7, 30, or 90)")):
+    return await get_weekly_brief_payload(days=days)
 
 
 @router.get("/integrations")
