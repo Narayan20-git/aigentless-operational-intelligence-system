@@ -10,17 +10,28 @@ Inventory (/api/inventory/vacant-units):
   tour_steps (unit_id), bookings (floorplan_id, applications proxy).
 """
 import asyncio
+import http.client
+import json
+import logging
+import os
+import time
 from collections import Counter, defaultdict
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 from config.database import get_client
+
+logger = logging.getLogger(__name__)
 
 # PostgREST URL length limits are generous; larger chunks = fewer round trips to Supabase.
 _IN_CHUNK = 48
 
 _coalesce_lock = asyncio.Lock()
 _coalesce_tasks: dict[str, asyncio.Task[Any]] = {}
+_inventory_ai_cache: dict[str, tuple[float, tuple[str, str]]] = {}
+_INVENTORY_AI_CACHE_TTL_SEC = 15 * 60
 
 
 def _dash_cache_key(prefix: str, property_id: str | None, days: int) -> str:
@@ -483,6 +494,174 @@ def _inventory_unit_guidance(
     )
 
 
+def _normalize_feedback_token(v: Any) -> str:
+    s = str(v or "").strip()
+    if not s:
+        return ""
+    if s.startswith("likes_") or s.startswith("improvement_"):
+        s = s.replace("_", " ")
+    return s[:80]
+
+
+def _feedback_summary_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    likes: Counter[str] = Counter()
+    improvements: Counter[str] = Counter()
+    ratings: Counter[str] = Counter()
+    sample_comments: list[str] = []
+    for r in rows:
+        raw = r.get("raw_feedback")
+        if not isinstance(raw, dict):
+            continue
+        rating = str(raw.get("rating") or "").strip().lower()
+        if rating:
+            ratings[rating] += 1
+        for x in raw.get("likes") or []:
+            t = _normalize_feedback_token(x)
+            if t:
+                likes[t] += 1
+        for x in raw.get("improvements") or []:
+            t = _normalize_feedback_token(x)
+            if t:
+                improvements[t] += 1
+        for key in ("additionalCommentsLikes", "additionalCommentsImprovements"):
+            c = str(raw.get(key) or "").strip()
+            if c:
+                sample_comments.append(c[:140])
+    return {
+        "total_feedback": len(rows),
+        "top_likes": [k for k, _ in likes.most_common(5)],
+        "top_improvements": [k for k, _ in improvements.most_common(5)],
+        "ratings": dict(ratings),
+        "comments": sample_comments[:5],
+    }
+
+
+def _gemini_guidance_from_feedback(
+    *,
+    unit_code: str,
+    property_name: str,
+    unit_type: str,
+    window_days: int,
+    vacancy_days: int,
+    tours: int,
+    apps: int,
+    conv_pct: float,
+    feedback_rows: list[dict[str, Any]],
+    fallback: tuple[str, str],
+) -> tuple[str, str]:
+    # Key is read from environment (typically loaded from .env at app startup/reload).
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return fallback
+    if len(feedback_rows) < 5:
+        return fallback
+    summary = _feedback_summary_from_rows(feedback_rows)
+    cache_key = (
+        f"{unit_code}|{window_days}|{vacancy_days}|{tours}|{apps}|{int(round(conv_pct))}|"
+        f"{summary['total_feedback']}|{','.join(summary['top_improvements'][:3])}"
+    )
+    now = time.time()
+    cached = _inventory_ai_cache.get(cache_key)
+    if cached and (now - cached[0]) <= _INVENTORY_AI_CACHE_TTL_SEC:
+        return cached[1]
+
+    prompt = {
+        "task": "Generate concise leasing operations guidance for one unit.",
+        "constraints": [
+            "Use ONLY provided signals and feedback summary.",
+            "Return valid JSON with keys: why_matters, recommended_action.",
+            "Each field max 180 chars.",
+            "No markdown, no bullets, no extra keys.",
+        ],
+        "unit_context": {
+            "unit_code": unit_code,
+            "property_name": property_name,
+            "unit_type": unit_type,
+            "window_days": window_days,
+            "vacancy_days": vacancy_days,
+            "tours": tours,
+            "apps": apps,
+            "conversion_pct": round(conv_pct, 1),
+        },
+        "feedback_summary": summary,
+    }
+    body = {
+        "contents": [{"parts": [{"text": json.dumps(prompt, ensure_ascii=True)}]}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "topP": 0.8,
+            "responseMimeType": "application/json",
+        },
+    }
+    model = os.getenv("GEMINI_MODEL", "").strip() or "gemini-2.0-flash"
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:generateContent?key={api_key}"
+    )
+    req = urllib_request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=12) as resp:
+            status = getattr(resp, "status", None) or resp.getcode()
+            data = json.loads(resp.read().decode("utf-8"))
+        logger.info(
+            "Gemini generateContent HTTP %s unit=%s model=%s",
+            status,
+            unit_code,
+            model,
+        )
+        text = (
+            data.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [{}])[0]
+            .get("text", "")
+        )
+        parsed = json.loads(text) if text else {}
+        why = str(parsed.get("why_matters") or "").strip()
+        action = str(parsed.get("recommended_action") or "").strip()
+        if not why or not action:
+            logger.warning(
+                "Gemini returned empty why/action; using fallback unit=%s", unit_code
+            )
+            return fallback
+        out = (why[:180], action[:180])
+        _inventory_ai_cache[cache_key] = (now, out)
+        return out
+    except urllib_error.HTTPError as e:
+        body = ""
+        try:
+            body = (e.read() or b"").decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        logger.warning(
+            "Gemini generateContent HTTP %s unit=%s model=%s body=%s",
+            e.code,
+            unit_code,
+            model,
+            body,
+        )
+        return fallback
+    except (
+        urllib_error.URLError,
+        http.client.HTTPException,
+        TimeoutError,
+        json.JSONDecodeError,
+        KeyError,
+        ValueError,
+    ) as e:
+        logger.warning(
+            "Gemini call failed unit=%s model=%s: %s",
+            unit_code,
+            model,
+            e,
+        )
+        return fallback
+
+
 def _space_is_vacant_for_inventory(status_val: Any) -> bool:
     """Match common PMS / migration values; seed used lowercase 'available' only."""
     raw = str(status_val or "").strip().lower().replace(" ", "_")
@@ -658,6 +837,35 @@ def _build_inventory_vacant_sync(property_id: str | None = None, days: int = 7) 
 
         fp_ids = list({str(u["floorplan_id"]) for u in units_list if u.get("floorplan_id")})
         booking_counts = _booking_counts_since_by_floorplan(client, fp_ids, since)
+        feedback_by_floorplan: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        if fp_ids:
+            since_iso = since.isoformat()
+            for batch in _chunks(fp_ids, _IN_CHUNK):
+                try:
+                    fr = (
+                        client.table("feedback")
+                        .select("floorplan_id,created_at,raw_feedback,type")
+                        .in_("floorplan_id", batch)
+                        .eq("type", "Unit")
+                        .gte("created_at", since_iso)
+                        .limit(4000)
+                        .execute()
+                    )
+                    rows = fr.data or []
+                except Exception:
+                    fr = (
+                        client.table("feedback")
+                        .select("floorplan_id,created_at,raw_feedback,type")
+                        .in_("floorplan_id", batch)
+                        .eq("type", "Unit")
+                        .limit(4000)
+                        .execute()
+                    )
+                    rows = [r for r in (fr.data or []) if _dt_gte_since(r.get("created_at"), since)]
+                for r in rows:
+                    fp = str(r.get("floorplan_id") or "")
+                    if fp:
+                        feedback_by_floorplan[fp].append(r)
 
         fp_bedrooms = _floorplan_bedrooms_map(client, fp_ids)
 
@@ -701,6 +909,18 @@ def _build_inventory_vacant_sync(property_id: str | None = None, days: int = 7) 
                 apps=apps_n,
                 conv_pct=conv_float,
                 unit_type=utype,
+            )
+            why_matters, recommended_action = _gemini_guidance_from_feedback(
+                unit_code=str(u.get("unit") or uid[:8]),
+                property_name=pname,
+                unit_type=utype,
+                window_days=days,
+                vacancy_days=vacancy_days,
+                tours=tours_n,
+                apps=apps_n,
+                conv_pct=conv_float,
+                feedback_rows=feedback_by_floorplan.get(fp, []),
+                fallback=(why_matters, recommended_action),
             )
 
             vacant_units.append(
