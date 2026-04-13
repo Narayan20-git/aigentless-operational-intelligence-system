@@ -148,7 +148,15 @@ def seed_leads(client: Any, inventory_rows: list[dict]) -> int:
 
         n_events = 3 if i % 4 == 0 else 2 if i % 3 == 0 else 1
         for j in range(n_events):
-            ev_time = now - timedelta(hours=min(167, (i * 3 + j * 5) % 168))
+            # Spread across ~0–7d, ~8–30d, and ~31–90d so 7 / 30 / 90 day filters show different volumes.
+            b = (i - 1) % 40
+            if b < 14:
+                base_days = (b + j) % 7
+            elif b < 27:
+                base_days = 10 + (b + j * 3) % 18
+            else:
+                base_days = 35 + (b + j * 5) % 48
+            ev_time = now - timedelta(days=base_days, hours=(i * 3 + j * 5) % 24)
             ev_name = "tour_booked" if j == 0 else "message_sent"
             ev_payload = {
                 "property_id": str(prop),
@@ -165,7 +173,14 @@ def seed_leads(client: Any, inventory_rows: list[dict]) -> int:
             client.table("prospect_events").insert(ev_payload).execute()
 
         if i % 2 == 0:
-            st = now - timedelta(hours=min(167, (i * 2 + 1) % 120))
+            b = (i - 1) % 40
+            if b < 14:
+                bd = (i % 7)
+            elif b < 27:
+                bd = 12 + (i % 12)
+            else:
+                bd = 40 + (i % 35)
+            st = now - timedelta(days=bd, hours=(i * 2 + 1) % 24)
             en = st + timedelta(minutes=45)
             bid = str(uuid.uuid4())
             client.table("bookings").insert(

@@ -168,8 +168,21 @@ def build_integrations_payload() -> dict[str, Any]:
 
 
 def build_onboarding_payload(property_id: str | None, days: int) -> dict[str, Any]:
-    _ = days
+    from services.dashboard_service import normalize_dashboard_days
+
+    d = normalize_dashboard_days(days)
+    since_iso = (datetime.now(UTC) - timedelta(days=d)).isoformat()
     client = get_client()
+
+    event_total = 0
+    try:
+        ev_q = client.table("prospect_events").select("id", count="exact").gte("timestamp", since_iso)
+        if property_id:
+            ev_q = ev_q.eq("property_id", str(property_id))
+        er = ev_q.limit(1).execute()
+        event_total = int(er.count or 0)
+    except Exception:
+        pass
     pq = client.table("properties").select("id,name,go_live_date,created_at").order("name").limit(50)
     if property_id:
         pq = pq.eq("id", property_id)
@@ -286,6 +299,7 @@ def build_onboarding_payload(property_id: str | None, days: int) -> dict[str, An
             {"id": "inProgress", "value": str(in_prog), "label": "In Progress", "valueClass": "text-amber-600"},
             {"id": "blocked", "value": str(blocked), "label": "Blocked", "valueClass": "text-red-600"},
             {"id": "avg", "value": f"{avg_c}%", "label": "Avg Completeness", "valueClass": "text-[#1B2B48]"},
+            {"id": "leadEvents", "value": str(event_total), "label": f"Lead events ({d}d)", "valueClass": "text-[#1B2B48]"},
         ],
         "listTitle": "Properties",
         "emptyStateText": "No properties available",
@@ -293,11 +307,10 @@ def build_onboarding_payload(property_id: str | None, days: int) -> dict[str, An
     }
 
 
-def build_portfolio_overview(property_id: str | None, days: int) -> dict[str, Any]:
-    from services.dashboard_service import _build_inventory_vacant_sync, normalize_dashboard_days
+def build_portfolio_overview_from_inv(property_id: str | None, days: int, inv: dict[str, Any]) -> dict[str, Any]:
+    from services.dashboard_service import normalize_dashboard_days
 
     d = normalize_dashboard_days(days)
-    inv = _build_inventory_vacant_sync(property_id, d)
     vacant_by_prop: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for u in inv.get("vacantUnits") or []:
         pid = str(u.get("propertyId") or "")
@@ -395,9 +408,12 @@ def build_portfolio_overview(property_id: str | None, days: int) -> dict[str, An
     }
 
 
-def build_weekly_brief() -> dict[str, Any]:
+def build_weekly_brief(days: int = 7) -> dict[str, Any]:
     client = get_client()
-    since = datetime.now(UTC) - timedelta(days=7)
+    from services.dashboard_service import normalize_dashboard_days
+
+    d = normalize_dashboard_days(days)
+    since = datetime.now(UTC) - timedelta(days=d)
     since_iso = since.isoformat()
 
     event_rows: list[dict[str, Any]] = []
@@ -427,10 +443,10 @@ def build_weekly_brief() -> dict[str, Any]:
     wins: list[dict[str, str]] = []
     for ev, n in top_obj[:5]:
         if "tour" in ev.lower() or "book" in ev.lower():
-            wins.append({"lead": f"{ev}", "detail": f"{n} events in the last 7 days"})
+            wins.append({"lead": f"{ev}", "detail": f"{n} events in the last {d} days"})
 
     if not wins:
-        wins = [{"lead": "Activity", "detail": f"{len(event_rows)} prospect events recorded in the last 7 days."}]
+        wins = [{"lead": "Activity", "detail": f"{len(event_rows)} prospect events recorded in the last {d} days."}]
 
     blockers_items: list[dict[str, str]] = []
     try:
@@ -459,7 +475,7 @@ def build_weekly_brief() -> dict[str, Any]:
     week_label = iso_monday.strftime("%b %d, %Y")
 
     summary_body = (
-        f"In the last 7 days we recorded {len(event_rows)} prospect events across tracked properties. "
+        f"In the last {d} days we recorded {len(event_rows)} prospect events across tracked properties. "
         f"Top signal: {top_obj[0][0] if top_obj else 'n/a'}."
     )
 
@@ -477,12 +493,15 @@ def build_weekly_brief() -> dict[str, Any]:
     }
 
 
-def build_home_payload(property_id: str | None, days: int) -> dict[str, Any]:
-    from services.dashboard_service import _build_inventory_vacant_sync, _build_leads_summary_sync, normalize_dashboard_days
+def build_home_payload_from_parts(
+    property_id: str | None,
+    days: int,
+    inv: dict[str, Any],
+    leads: dict[str, Any],
+) -> dict[str, Any]:
+    from services.dashboard_service import normalize_dashboard_days
 
     d = normalize_dashboard_days(days)
-    inv = _build_inventory_vacant_sync(property_id, d)
-    leads = _build_leads_summary_sync(property_id, d)
 
     at_risk: list[dict[str, Any]] = []
     for i, u in enumerate(inv.get("vacantUnits") or []):
@@ -535,7 +554,7 @@ def build_home_payload(property_id: str | None, days: int) -> dict[str, Any]:
 
     # Tour insights: recent tour-related events by property
     client = get_client()
-    since = datetime.now(UTC) - timedelta(days=14)
+    since = datetime.now(UTC) - timedelta(days=d)
     tour_insights: list[dict[str, Any]] = []
     try:
         er = (
@@ -565,7 +584,7 @@ def build_home_payload(property_id: str | None, days: int) -> dict[str, Any]:
                     "id": f"ti-{pid}",
                     "tone": "negative" if mentions < 3 else "positive",
                     "property": prop_names.get(pid, "Property"),
-                    "text": "Tour-related activity in the last 14 days.",
+                    "text": f"Tour-related activity in the last {d} days.",
                     "mentions": mentions,
                 }
             )
