@@ -5,13 +5,23 @@ Imported at runtime from dashboard_service to avoid circular import issues.
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
 import os
+import time
 from collections import Counter, defaultdict
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from config.database import get_client
+from services.home_llm import enrich_home_narrative_llm
+from services.home_ui_copy import format_template, load_home_ui_copy
 
+logger = logging.getLogger(__name__)
+
+_PORTFOLIO_REC_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
 def _parse_ts(value: Any) -> datetime | None:
     from services.dashboard_service import _parse_ts as _p
@@ -307,103 +317,344 @@ def build_onboarding_payload(property_id: str | None, days: int) -> dict[str, An
     }
 
 
-def build_portfolio_overview_from_inv(property_id: str | None, days: int, inv: dict[str, Any]) -> dict[str, Any]:
+def _portfolio_rating_from_signals(health: int) -> tuple[str, str]:
+    """Deterministic badge rule: Excellent / Good / Needs Attention."""
+    if health >= 92:
+        return "excellent", "Excellent"
+    if health >= 82:
+        return "good", "Good"
+    return "needsAttention", "Needs Attention"
+
+
+def _fallback_portfolio_recommendations(portfolio_properties: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = sorted(
+        [x for x in portfolio_properties if str(x.get("status")) != "healthy"],
+        key=lambda x: int(x.get("health") or 0),
+    )[:3]
+    out: list[dict[str, Any]] = []
+    for i, x in enumerate(rows, start=1):
+        nm = str(x.get("name") or "Property")
+        out.append(
+            {
+                "id": f"rec-{i}",
+                "icon": "alert",
+                "title": f"Prioritize {nm} conversion fixes",
+                "description": str(x.get("insight") or "")[:220],
+                "tags": [{"label": "High priority", "tone": "red"}],
+            }
+        )
+    return out
+
+
+def _llm_portfolio_recommendations(
+    *,
+    days: int,
+    portfolio_properties: list[dict[str, Any]],
+    metric_cards: list[dict[str, Any]],
+    fallback: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if os.getenv("SKIP_PORTFOLIO_RECS_LLM", "").strip().lower() in ("1", "true", "yes", "on"):
+        return fallback
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return fallback
+    try:
+        from openai import OpenAI
+    except Exception:
+        return fallback
+
+    cache_key = hashlib.sha256(
+        json.dumps(
+            {"d": days, "cards": metric_cards, "props": portfolio_properties},
+            sort_keys=True,
+            default=str,
+        ).encode()
+    ).hexdigest()[:48]
+    ttl_raw = os.getenv("PORTFOLIO_RECS_LLM_CACHE_TTL_SEC", "").strip()
+    try:
+        ttl = max(60.0, min(7200.0, float(ttl_raw))) if ttl_raw else 420.0
+    except ValueError:
+        ttl = 420.0
+    hit = _PORTFOLIO_REC_CACHE.get(cache_key)
+    now = time.time()
+    if hit and (now - hit[0]) <= ttl:
+        return hit[1]
+
+    system = """You generate Portfolio-Level Recommendations JSON for leasing operations.
+Use ONLY provided database_summary values. Never invent properties, units, dollars, or percentages.
+Return valid JSON: {"recommendations":[{"title":"...","description":"...","action":"...","priority":"high|medium|opportunity","icon":"alert|trend|ops"}]}.
+Rules:
+- 3 recommendations max.
+- Each recommendation must name at least one property from database_summary.portfolio_properties.
+- Description must cite concrete metrics already present.
+- Action is short and imperative (2-4 words).
+"""
+    user_obj = {
+        "window_days": days,
+        "database_summary": {
+            "metric_cards": metric_cards,
+            "portfolio_properties": portfolio_properties[:10],
+        },
+    }
+    timeout_raw = os.getenv("PORTFOLIO_RECS_LLM_TIMEOUT_SEC", "").strip()
+    try:
+        timeout = max(10.0, min(60.0, float(timeout_raw))) if timeout_raw else 24.0
+    except ValueError:
+        timeout = 24.0
+    client = OpenAI(api_key=api_key, timeout=timeout)
+    try:
+        resp = client.chat.completions.create(
+            model=os.getenv("PORTFOLIO_RECS_LLM_MODEL", "").strip() or os.getenv("OPENAI_MODEL", "").strip() or "gpt-4o-mini",
+            temperature=0.2,
+            max_tokens=900,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(user_obj, ensure_ascii=True)},
+            ],
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        parsed = json.loads(text) if text else {}
+        items = parsed.get("recommendations")
+        if not isinstance(items, list):
+            return fallback
+        out: list[dict[str, Any]] = []
+        for i, it in enumerate(items[:3], start=1):
+            if not isinstance(it, dict):
+                continue
+            title = str(it.get("title") or "").strip()
+            desc = str(it.get("description") or "").strip()
+            if not title or not desc:
+                continue
+            pr = str(it.get("priority") or "medium").strip().lower()
+            tag = (
+                {"label": "High priority", "tone": "red"}
+                if pr == "high"
+                else {"label": "Opportunity", "tone": "green"}
+                if pr == "opportunity"
+                else {"label": "Medium priority", "tone": "yellow"}
+            )
+            out.append(
+                {
+                    "id": f"rec-{i}",
+                    "icon": str(it.get("icon") or "ops")[:24],
+                    "title": title[:120],
+                    "description": desc[:260],
+                    "tags": [tag],
+                }
+            )
+        if out:
+            _PORTFOLIO_REC_CACHE[cache_key] = (now, out)
+            return out
+        return fallback
+    except Exception as e:
+        logger.warning("portfolio recommendations llm skipped: %s", e)
+        return fallback
+
+
+def build_portfolio_overview_from_inv(
+    property_id: str | None, days: int, inv: dict[str, Any], *, use_recommendation_llm: bool = True
+) -> dict[str, Any]:
     from services.dashboard_service import normalize_dashboard_days
 
     d = normalize_dashboard_days(days)
-    vacant_by_prop: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for u in inv.get("vacantUnits") or []:
-        pid = str(u.get("propertyId") or "")
-        if pid:
-            vacant_by_prop[pid].append(u)
-        else:
-            vacant_by_prop[str(u.get("property") or "")].append(u)
-
     client = get_client()
-    pq = client.table("properties").select("id,name,neighborhood_name").order("name").limit(30)
+
+    # DB source of truth: properties, units count, and live vacant-unit metrics from inventory payload.
+    pq = client.table("properties").select("id,name,neighborhood_name,units").order("name").limit(60)
     if property_id:
         pq = pq.eq("id", property_id)
     props = pq.execute().data or []
+    prop_ids = [str(x.get("id")) for x in props if x.get("id")]
+    prop_ids_set = set(prop_ids)
 
-    total_vacant = len(inv.get("vacantUnits") or [])
-    conv_vals: list[float] = []
+    units_total_by_prop: Counter[str] = Counter()
+    units_declared_by_prop: dict[str, int] = {}
+    for p in props:
+        pid = str(p.get("id") or "")
+        try:
+            declared = int(p.get("units") or 0)
+        except (TypeError, ValueError):
+            declared = 0
+        if pid and declared > 0:
+            units_declared_by_prop[pid] = declared
+    if prop_ids:
+        for i in range(0, len(prop_ids), 40):
+            batch = prop_ids[i : i + 40]
+            try:
+                ur = client.table("units").select("id,property_id").in_("property_id", batch).limit(1200).execute()
+                for u in ur.data or []:
+                    pid = str(u.get("property_id") or "")
+                    if pid:
+                        units_total_by_prop[pid] += 1
+            except Exception:
+                pass
+
+    vacant_by_prop: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for u in inv.get("vacantUnits") or []:
+        pid = str(u.get("propertyId") or "")
+        if property_id and pid != property_id:
+            continue
+        if prop_ids_set and pid and pid not in prop_ids_set:
+            continue
+        if pid:
+            vacant_by_prop[pid].append(u)
+
+    all_vacant = [u for rows in vacant_by_prop.values() for u in rows]
+    total_vacant = len(all_vacant)
+    conv_vals: list[float] = []
+    for u in all_vacant:
         try:
             conv_vals.append(float(str(u.get("conv", "0")).replace("%", "")))
         except ValueError:
             pass
     avg_conv = sum(conv_vals) / max(1, len(conv_vals))
-    avg_vac_days = (
-        sum(int(u.get("days") or 0) for u in inv.get("vacantUnits") or []) / max(1, total_vacant) if total_vacant else 0.0
+    avg_vac_days = sum(int(u.get("days") or 0) for u in all_vacant) / max(1, total_vacant) if total_vacant else 0.0
+    total_units = (
+        sum(max(int(units_total_by_prop.get(pid, 0)), int(units_declared_by_prop.get(pid, 0))) for pid in prop_ids_set)
+        or max(1, len(props) * 100)
     )
+    occ = max(0.0, min(100.0, ((total_units - total_vacant) / max(1, total_units)) * 100.0))
 
-    occ = max(0.0, min(100.0, 100.0 - (avg_vac_days * 1.2)))
-    occ_s = f"{int(round(occ))}%"
-
-    portfolio_properties: list[dict[str, Any]] = []
-    for i, p in enumerate(props):
-        pid = str(p["id"])
+    prop_metrics: list[dict[str, Any]] = []
+    for p in props:
+        pid = str(p.get("id") or "")
         rows = vacant_by_prop.get(pid, [])
-        if rows:
-            tours = sum(int(x.get("tours") or 0) for x in rows)
-            convs = [float(str(x.get("conv", "0")).replace("%", "")) for x in rows]
-            cavg = sum(convs) / max(1, len(convs))
-            vac_n = len(rows)
-            insight = f"{vac_n} vacant unit(s); avg conversion {int(round(cavg))}%."
-            health = max(20, min(100, int(cavg)))
-            if cavg >= 75 and vac_n <= 5:
-                st = "healthy"
-            elif cavg >= 50:
-                st = "watch"
-            else:
-                st = "attention"
-        else:
-            tours = 0
-            cavg = avg_conv
-            vac_n = 0
-            insight = "No vacant units in current inventory window."
-            health = 75
-            st = "healthy"
+        vac_n = len(rows)
+        tours = sum(int(x.get("tours") or 0) for x in rows)
+        convs: list[float] = []
+        for x in rows:
+            try:
+                convs.append(float(str(x.get("conv", "0")).replace("%", "")))
+            except ValueError:
+                pass
+        cavg = sum(convs) / max(1, len(convs)) if convs else avg_conv
+        total_units_prop = max(int(units_total_by_prop.get(pid, 0)), int(units_declared_by_prop.get(pid, 0)))
+        vacancy_rate = (vac_n / max(1, total_units_prop)) * 100 if total_units_prop else 0.0
 
-        loc = (str(p.get("neighborhood_name") or "").strip() or "Portfolio")
-        portfolio_properties.append(
+        loc = str(p.get("neighborhood_name") or "").strip() or "Portfolio"
+        location_line = f"{loc} \u00b7 {total_units_prop} units" if total_units_prop else loc
+        prop_metrics.append(
             {
                 "id": pid,
                 "name": p.get("name") or "Property",
-                "locationLine": loc,
-                "status": st,
-                "health": health,
-                "conversion": str(int(round(cavg))),
-                "vacancy": str(vac_n),
-                "tours": str(tours),
-                "insight": insight,
-                "insightAlert": st == "attention",
-                "stressMetrics": [{"label": "Lead Volume", "value": "medium" if st != "healthy" else "low"}],
+                "locationLine": location_line,
+                "cavg": float(cavg),
+                "vacancy_rate": float(vacancy_rate),
+                "vac_n": int(vac_n),
+                "total_units_prop": int(total_units_prop),
+                "tours": int(tours),
             }
         )
 
-    recommendations = [
-        {
-            "id": f"rec-{i}",
-            "icon": "chart",
-            "title": f"Improve conversion at {x['name']}",
-            "description": x["insight"],
-            "tags": [{"label": "leasing", "tone": "gray"}, {"label": "priority", "tone": "yellow"}],
-            "action": "View details",
-            "actionVariant": "solid",
-        }
-        for i, x in enumerate([p for p in portfolio_properties if p["status"] != "healthy"][:10], start=1)
-    ]
+    # Two-pass scoring for realistic spread across portfolio:
+    # combines absolute quality + relative rank inside this portfolio snapshot.
+    if prop_metrics:
+        avg_prop_conv = sum(x["cavg"] for x in prop_metrics) / len(prop_metrics)
+        avg_prop_vac_rate = sum(x["vacancy_rate"] for x in prop_metrics) / len(prop_metrics)
+    else:
+        avg_prop_conv = avg_conv
+        avg_prop_vac_rate = 0.0
+
+    scored: list[dict[str, Any]] = []
+    for x in prop_metrics:
+        conv_delta = x["cavg"] - avg_prop_conv
+        vac_delta = x["vacancy_rate"] - avg_prop_vac_rate
+        raw = (
+            74
+            + (0.65 * conv_delta)
+            - (2.2 * max(0.0, vac_delta))
+            - (0.9 * x["vacancy_rate"])
+            + min(8.0, x["tours"] * 0.35)
+        )
+        scored.append({**x, "raw_health": raw})
+
+    scored_sorted = sorted(scored, key=lambda x: x["raw_health"], reverse=True)
+    n = len(scored_sorted)
+    top_n = max(1, int(round(n * 0.35)))
+    bottom_n = max(1, int(round(n * 0.25)))
+
+    portfolio_properties: list[dict[str, Any]] = []
+    for idx, x in enumerate(scored_sorted):
+        base_health = int(round(max(45.0, min(98.0, x["raw_health"]))))
+        if idx < top_n:
+            health = max(88, base_health)
+            rating = "Excellent"
+            st = "healthy"
+        elif idx >= n - bottom_n:
+            health = min(79, base_health)
+            rating = "Needs Attention"
+            st = "attention"
+        else:
+            health = min(89, max(80, base_health))
+            rating = "Good"
+            st = "healthy"
+
+        insight = (
+            f"{x['vac_n']} vacant of {x['total_units_prop']} units; {int(round(x['cavg']))}% avg conversion across vacant sample."
+            if x["total_units_prop"]
+            else f"{x['vac_n']} vacant units; {int(round(x['cavg']))}% avg conversion across vacant sample."
+        )
+        portfolio_properties.append(
+            {
+                "id": x["id"],
+                "name": x["name"],
+                "locationLine": x["locationLine"],
+                "status": st,
+                "rating": rating,
+                "health": health,
+                "conversion": str(int(round(x["cavg"]))),
+                "vacancy": str(int(round(x["vacancy_rate"]))),
+                "tours": str(x["tours"]),
+                "insight": insight,
+                "insightAlert": st == "attention",
+                "stressMetrics": [{"label": "Lead Volume", "value": "medium" if st == "attention" else "low"}],
+            }
+        )
+
+    fallback_recs = _fallback_portfolio_recommendations(portfolio_properties)
+    recommendations = (
+        _llm_portfolio_recommendations(
+            days=d,
+            portfolio_properties=portfolio_properties,
+            metric_cards=[
+                {"label": "Occupancy (est.)", "value": f"{int(round(occ))}%"},
+                {"label": "Tour to App (avg)", "value": f"{int(round(avg_conv))}%"},
+                {"label": "Avg Vacancy Days", "value": f"{int(round(avg_vac_days))}d"},
+            ],
+            fallback=fallback_recs,
+        )
+        if use_recommendation_llm
+        else fallback_recs
+    )
 
     return {
-        "page": {"title": "Portfolio Overview", "description": "Portfolio-level KPIs (live)"},
+        "page": {"title": "Portfolio Overview", "description": "Portfolio-level KPIs (live database metrics)"},
         "metricCards": [
-            {"id": "m1", "value": occ_s, "label": "Occupancy (est.)", "footerKind": "trend", "footerText": "Based on vacant unit sample"},
-            {"id": "m2", "value": f"{int(round(avg_conv))}%", "label": "Tour to App (avg)", "footerKind": "plain", "footerText": "From vacant-unit window"},
-            {"id": "m3", "value": f"{int(round(avg_vac_days))}d", "label": "Avg Vacancy Days", "footerKind": "plain", "footerText": "Vacant units in table"},
+            {
+                "id": "m1",
+                "value": f"{int(round(occ))}%",
+                "label": "Occupancy (est.)",
+                "footerKind": "trend",
+                "footerText": "Computed from units + vacant inventory",
+            },
+            {
+                "id": "m2",
+                "value": f"{int(round(avg_conv))}%",
+                "label": "Tour to App (avg)",
+                "footerKind": "plain",
+                "footerText": "From vacant-unit database sample",
+            },
+            {
+                "id": "m3",
+                "value": f"{int(round(avg_vac_days))}d",
+                "label": "Avg Vacancy Days",
+                "footerKind": "plain",
+                "footerText": "Vacant units in current window",
+            },
         ],
         "portfolioProperties": portfolio_properties,
-        "recommendationsSectionTitle": "AI Recommendations",
+        "recommendationsSectionTitle": "Portfolio-Level Recommendations",
         "recommendations": recommendations,
     }
 
@@ -466,9 +717,20 @@ def build_weekly_brief(days: int = 7) -> dict[str, Any]:
 
     objections_items = [{"topic": ev, "mentions": n} for ev, n in top_obj[:8]]
 
+    def _humanize_event_code(ev: str) -> str:
+        s = (ev or "").replace("_", " ").strip()
+        return s[:1].upper() + s[1:] if s else ev
+
     next_actions = []
     for i, (ev, _) in enumerate(top_obj[:5], start=1):
-        next_actions.append({"n": i, "title": f"Review funnel step: {ev}", "subtitle": "Owner: Leasing ops"})
+        label = _humanize_event_code(str(ev))
+        next_actions.append(
+            {
+                "n": i,
+                "title": f'Prioritize follow-up for "{label}" activity',
+                "subtitle": "Template fallback — enable OpenAI in .env for AI-written actions from your data.",
+            }
+        )
 
     today = datetime.now(UTC).date()
     iso_monday = today - timedelta(days=today.weekday())
@@ -486,11 +748,34 @@ def build_weekly_brief(days: int = 7) -> dict[str, Any]:
             "title": "Executive Summary",
             "paragraphs": [{"body": summary_body}, {"body": "Review wins and blockers below; next actions prioritize the highest-volume event types."}],
         },
-        "wins": {"title": "Wins", "items": wins},
-        "blockers": {"title": "Blockers", "items": blockers_items},
-        "objections": {"title": "Top Objections / Signals", "items": objections_items},
-        "nextActions": {"title": "Next Actions", "items": next_actions},
+        "wins": {"title": "Biggest Wins", "items": wins},
+        "blockers": {"title": "Biggest Blockers", "items": blockers_items},
+        "objections": {"title": "Top Objections This Week", "items": objections_items},
+        "nextActions": {"title": "Recommended Next Actions", "items": next_actions},
     }
+
+
+def build_lesa_ai_weekly_brief(
+    property_id: str | None = None, days: int = 7, *, use_llm: bool = True
+) -> dict[str, Any]:
+    """
+    Lesa AI tab: compact DB digest (parallel fetch + feedback) → OpenAI → brief JSON.
+    Falls back to rule-based `build_weekly_brief` if the model call fails.
+    """
+    from services.dashboard_service import collect_lesa_ai_digest_sync, normalize_dashboard_days
+    from services.lesa_ai_llm import enrich_lesa_ai_page
+
+    d = normalize_dashboard_days(days)
+    fallback = build_weekly_brief(d)
+    fb = fallback.setdefault("page", {})
+    fb["title"] = "Weekly Operator Brief"
+    fb["weekLabelPrefix"] = "Week of"
+    digest = collect_lesa_ai_digest_sync(property_id, d)
+    if isinstance(digest.get("week_range_label"), str) and digest["week_range_label"].strip():
+        fallback["briefWeekLabel"] = digest["week_range_label"].strip()[:120]
+    if not use_llm:
+        return fallback
+    return enrich_lesa_ai_page(digest, fallback)
 
 
 def build_home_payload_from_parts(
@@ -502,22 +787,53 @@ def build_home_payload_from_parts(
     from services.dashboard_service import normalize_dashboard_days
 
     d = normalize_dashboard_days(days)
+    client = get_client()
+    tpl = load_home_ui_copy(client)
+
+    locale = tpl.get("locale") or {"dateLocale": "en-US", "headerTimeZone": "America/New_York"}
+    tz_name = str(locale.get("headerTimeZone") or "America/New_York")
+    try:
+        now_local = datetime.now(ZoneInfo(tz_name))
+        hour = now_local.hour
+    except Exception:
+        now_local = datetime.now(UTC)
+        hour = now_local.hour
+
+    greetings = tpl.get("greetings") or {}
+    if hour < 12:
+        header_greeting = str(greetings.get("morning") or "")
+    elif hour < 17:
+        header_greeting = str(greetings.get("afternoon") or "")
+    else:
+        header_greeting = str(greetings.get("evening") or "")
+
+    hot_n = int(leads.get("hot") or 0)
+    vac_n = len(inv.get("vacantUnits") or [])
+    at_risk_n = sum(1 for x in inv.get("vacantUnits") or [] if x.get("status") == "atRisk")
+
+    av_tpl = tpl.get("atRiskUnits") or {}
+    vl_tmpl = str(av_tpl.get("vacantLabelTemplate") or "{days} days vacant")
+    reason_fb = str(av_tpl.get("reasonFallback") or "")
 
     at_risk: list[dict[str, Any]] = []
     for i, u in enumerate(inv.get("vacantUnits") or []):
         if len(at_risk) >= 20:
             break
         if str(u.get("status")) == "atRisk" or int(u.get("days") or 0) >= 10:
+            dv = int(u.get("days") or 0)
             at_risk.append(
                 {
                     "id": f"risk-{u.get('id', i)}",
                     "unit": u.get("unitCode"),
                     "risk": "high" if u.get("status") == "atRisk" else "medium",
-                    "vacantLabel": f"{u.get('days', 0)} days vacant",
+                    "vacantLabel": format_template(vl_tmpl, {"days": dv}),
                     "property": u.get("property"),
-                    "reason": str(u.get("whyMatters") or "Vacancy pressure in current window."),
+                    "reason": str(u.get("whyMatters") or reason_fb),
                 }
             )
+
+    fq_tpl = tpl.get("followUpQueue") or {}
+    detail_fb = str(fq_tpl.get("detailFallback") or "")
 
     followup: list[dict[str, Any]] = []
     for i, row in enumerate((leads.get("data") or [])[:20]):
@@ -527,12 +843,16 @@ def build_home_payload_from_parts(
                 "id": f"fu-{row.get('id')}",
                 "name": row.get("name"),
                 "property": row.get("property"),
-                "detail": str(row.get("recommended_action") or "Follow up recommended."),
+                "detail": str(row.get("recommended_action") or detail_fb),
                 "heat": "hot" if heat == "hot" else "warm",
                 "timeAgo": _ago_from_iso(str(row.get("tour_time") or row.get("last_contact") or "")),
                 "channel": "sms" if i % 2 == 0 else "email",
             }
         )
+
+    lb_tpl = tpl.get("launchBlockers") or {}
+    issue_def = str(lb_tpl.get("issueDefault") or "")
+    detail_lb_fb = str(lb_tpl.get("detailFallback") or "")
 
     onb = build_onboarding_payload(property_id, d)
     launch_items: list[dict[str, Any]] = []
@@ -545,15 +865,17 @@ def build_home_payload_from_parts(
                     "name": p.get("name"),
                     "tag": "blocking",
                     "percent": int(p.get("completeness") or 40),
-                    "issue": "Onboarding checklist incomplete",
-                    "detail": b[0] if b else "Resolve onboarding blockers to go live.",
+                    "issue": issue_def,
+                    "detail": str(b[0]) if b else detail_lb_fb,
                 }
             )
         if len(launch_items) >= 20:
             break
 
-    # Tour insights: recent tour-related events by property
-    client = get_client()
+    ti_tpl = tpl.get("tourInsights") or {}
+    tour_row_tmpl = str(ti_tpl.get("rowTextTemplate") or "Tour-related activity in the last {d} days.")
+    tour_low_thr = int(ti_tpl.get("tourMentionsLowThreshold") or 3)
+
     since = datetime.now(UTC) - timedelta(days=d)
     tour_insights: list[dict[str, Any]] = []
     try:
@@ -582,94 +904,146 @@ def build_home_payload_from_parts(
             tour_insights.append(
                 {
                     "id": f"ti-{pid}",
-                    "tone": "negative" if mentions < 3 else "positive",
+                    "tone": "negative" if mentions < tour_low_thr else "positive",
                     "property": prop_names.get(pid, "Property"),
-                    "text": f"Tour-related activity in the last {d} days.",
+                    "text": format_template(tour_row_tmpl, {"d": d}),
                     "mentions": mentions,
                 }
             )
     except Exception:
         pass
 
-    hot_n = int(leads.get("hot") or 0)
-    vac_n = len(inv.get("vacantUnits") or [])
-    at_risk_n = sum(1 for x in inv.get("vacantUnits") or [] if x.get("status") == "atRisk")
+    fmt_ctx: dict[str, Any] = {
+        "vac_n": vac_n,
+        "hot_n": hot_n,
+        "followup_n": len(followup),
+        "at_risk_n": at_risk_n,
+        "d": d,
+    }
 
-    priority_items = [
-        {
-            "id": "pa-1",
-            "tag": "high",
-            "icon": "AlertTriangle",
-            "title": "Stabilize high-risk vacant inventory",
-            "lines": [f"{at_risk_n} units flagged at-risk in the current window."],
-        },
-        {
-            "id": "pa-2",
-            "tag": "high",
-            "icon": "Sparkles",
-            "title": "Accelerate follow-ups on hot pipeline leads",
-            "lines": [f"{hot_n} leads are currently marked hot."],
-        },
-    ]
+    pa_tpl = tpl.get("priorityActions") or {}
+    priority_items: list[dict[str, Any]] = []
+    for raw_pi in pa_tpl.get("items") or []:
+        if not isinstance(raw_pi, dict):
+            continue
+        cta_path = str(raw_pi.get("ctaPath") or "").strip()
+        if not cta_path:
+            t = str(raw_pi.get("title") or "").lower()
+            if "inventory" in t or "vacant" in t:
+                cta_path = "/packages"
+            elif "follow" in t or "pipeline" in t or "lead" in t:
+                cta_path = "/users"
+            elif "onboarding" in t or "blocker" in t or "launch" in t:
+                cta_path = "/properties"
+            else:
+                cta_path = "/analytics"
+        lines_in = raw_pi.get("lines") or []
+        lines_out = [format_template(str(line), fmt_ctx) for line in lines_in if line is not None]
+        priority_items.append(
+            {
+                "id": raw_pi.get("id"),
+                "tag": raw_pi.get("tag") or "high",
+                "icon": raw_pi.get("icon") or "Sparkles",
+                "title": str(raw_pi.get("title") or ""),
+                "ctaPath": cta_path,
+                "lines": lines_out,
+            }
+        )
 
-    brief_paragraphs = [
-        {
-            "body": f"Portfolio snapshot: {vac_n} vacant units in view, {hot_n} hot leads, {len(followup)} leads in the follow-up queue.",
-        },
-        {"body": "Prioritize repricing and outreach where vacancy days are elevated and tour volume is misaligned with applications."},
-    ]
+    dab = tpl.get("dailyAiBrief") or {}
+    brief_paragraphs: list[dict[str, str]] = []
+    for p in dab.get("fallbackParagraphs") or []:
+        if isinstance(p, dict) and p.get("body"):
+            brief_paragraphs.append({"body": format_template(str(p["body"]), fmt_ctx)})
+    if not brief_paragraphs:
+        brief_paragraphs = [{"body": format_template("", fmt_ctx)}]
+
+    links = tpl.get("links") or {}
+    full_brief_path = str(links.get("fullBriefPath") or "/ai")
+
+    tour_rec_title = str(ti_tpl.get("recommendedActionTitle") or "")
+    tour_rec_body = str(ti_tpl.get("recommendedActionBody") or "")
+
+    llm_metrics = {
+        "window_days": d,
+        "property_scope": property_id or "all_properties",
+        "vacant_units_in_view": vac_n,
+        "hot_leads": hot_n,
+        "followup_queue_count": len(followup),
+        "at_risk_marked_units": at_risk_n,
+        "at_risk_panel_units": len(at_risk),
+        "launch_blocker_properties": len(launch_items),
+        "properties_with_tour_signals": len(tour_insights),
+        "properties_low_tour_signal": sum(1 for x in tour_insights if x.get("tone") == "negative"),
+    }
+    brief_paragraphs, tour_rec_title, tour_rec_body = enrich_home_narrative_llm(
+        property_id=property_id,
+        window_days=d,
+        metrics=llm_metrics,
+        fallback_brief=brief_paragraphs,
+        fallback_tour_title=tour_rec_title,
+        fallback_tour_body=tour_rec_body,
+    )
+
+    labels = tpl.get("labels") or {}
+    errors = tpl.get("errors") or {}
 
     return {
-        "locale": {"dateLocale": "en-US", "headerTimeZone": "America/New_York"},
-        "headerSubtext": "Portfolio pulse and action queue (live)",
+        "locale": locale,
+        "headerGreeting": header_greeting,
+        "headerSubtext": str(tpl.get("headerSubtext") or ""),
         "dailyAiBrief": {
-            "title": "Daily AI Brief",
-            "subtitle": "What changed recently",
+            "title": str(dab.get("title") or ""),
+            "subtitle": str(dab.get("subtitle") or ""),
             "paragraphs": brief_paragraphs,
-            "fullBriefPath": "/ai",
-            "fullBriefLinkLabel": "Read full brief",
+            "fullBriefPath": full_brief_path,
+            "fullBriefLinkLabel": str(dab.get("fullBriefLinkLabel") or ""),
         },
         "priorityActions": {
-            "title": "Priority Actions",
-            "subtitle": "Top items derived from current inventory + pipeline",
+            "title": str(pa_tpl.get("title") or ""),
+            "subtitle": str(pa_tpl.get("subtitle") or ""),
             "items": priority_items,
         },
         "atRiskUnits": {
-            "title": "At-Risk Units",
-            "subtitle": "Units needing intervention",
+            "title": str(av_tpl.get("title") or ""),
+            "subtitle": str(av_tpl.get("subtitle") or ""),
             "summaryValue": str(len(at_risk)),
-            "summaryLabel": "Units",
+            "summaryLabel": str(av_tpl.get("summaryLabel") or ""),
             "items": at_risk,
-            "ctaPath": "/packages",
-            "ctaLabel": "View all",
+            "ctaPath": str(av_tpl.get("ctaPath") or "/packages"),
+            "ctaLabel": str(av_tpl.get("ctaLabel") or ""),
         },
         "launchBlockers": {
-            "title": "Launch Blockers",
-            "subtitle": "Items delaying activation",
+            "title": str(lb_tpl.get("title") or ""),
+            "subtitle": str(lb_tpl.get("subtitle") or ""),
             "summaryValue": str(len(launch_items)),
-            "summaryLabel": "Properties",
+            "summaryLabel": str(lb_tpl.get("summaryLabel") or ""),
             "items": launch_items,
-            "ctaPath": "/properties",
-            "ctaLabel": "View all",
+            "ctaPath": str(lb_tpl.get("ctaPath") or "/properties"),
+            "ctaLabel": str(lb_tpl.get("ctaLabel") or ""),
         },
         "followUpQueue": {
-            "title": "Follow-Up Queue",
-            "subtitle": "Leads requiring touchpoints",
+            "title": str(fq_tpl.get("title") or ""),
+            "subtitle": str(fq_tpl.get("subtitle") or ""),
             "summaryValue": str(len(followup)),
-            "summaryLabel": "Leads",
+            "summaryLabel": str(fq_tpl.get("summaryLabel") or ""),
             "items": followup,
-            "ctaPath": "/users",
-            "ctaLabel": "Open queue",
+            "ctaPath": str(fq_tpl.get("ctaPath") or "/users"),
+            "ctaLabel": str(fq_tpl.get("ctaLabel") or ""),
         },
         "tourInsights": {
-            "title": "Tour Insights",
-            "subtitle": "Recent tour signal volume by property",
-            "trendValue": "Live",
-            "trendLabel": "Last 14 days",
+            "title": str(ti_tpl.get("title") or ""),
+            "subtitle": str(ti_tpl.get("subtitle") or ""),
+            "trendValue": str(ti_tpl.get("trendValue") or ""),
+            "trendLabel": format_template(str(ti_tpl.get("trendLabelTemplate") or ""), {"d": d}),
             "items": tour_insights,
-            "recommendedActionTitle": "Recommended action",
-            "recommendedActionBody": "Tune tour scheduling and follow-up scripts for properties with low tour mentions.",
-            "ctaPath": "/analytics",
-            "ctaLabel": "Open insights",
+            "recommendedActionTitle": tour_rec_title,
+            "recommendedActionBody": tour_rec_body,
+            "ctaPath": str(ti_tpl.get("ctaPath") or "/analytics"),
+            "ctaLabel": str(ti_tpl.get("ctaLabel") or ""),
+        },
+        "ui": {
+            "labels": labels,
+            "errors": errors,
         },
     }

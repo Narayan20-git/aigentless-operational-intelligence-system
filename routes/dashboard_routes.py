@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from config.database import db_is_ready, startup_database
 from services.dashboard_service import (
     get_home_payload,
+    get_home_ui_copy_payload,
     get_header_payload,
     get_integrations_payload,
     get_inventory_payload,
@@ -41,16 +42,26 @@ async def properties_options():
 async def dashboard_home(
     property_id: str | None = Query(None, description="Filter widgets to this property UUID"),
     days: int = Query(7, description="Rolling window in days (7, 30, or 90)"),
+    enrich_leads: bool = Query(
+        True,
+        description="If false, skip OpenAI on lead cards (faster load; heuristic copy only).",
+    ),
 ):
-    return await get_home_payload(property_id=property_id, days=days)
+    return await get_home_payload(property_id=property_id, days=days, enrich_leads=enrich_leads)
 
 
 @router.get("/leads/summary")
 async def leads_summary(
     property_id: str | None = Query(None),
     days: int = Query(7),
+    enrich: bool = Query(
+        True,
+        description="If false, skip OpenAI enrichment (faster; heuristic objections/alternates/draft).",
+    ),
 ):
-    return await get_leads_summary_payload(property_id=property_id, days=days)
+    return await get_leads_summary_payload(
+        property_id=property_id, days=days, enrich_with_llm=enrich
+    )
 
 
 @router.get("/inventory/vacant-units")
@@ -73,13 +84,28 @@ async def properties_onboarding(
 async def portfolio_overview(
     property_id: str | None = Query(None),
     days: int = Query(7),
+    enrich_recommendations: bool = Query(
+        True,
+        description="If false, skip LLM recommendations and use DB-based fallback recommendations.",
+    ),
 ):
-    return await get_portfolio_overview_payload(property_id=property_id, days=days)
+    return await get_portfolio_overview_payload(
+        property_id=property_id, days=days, enrich_recommendations=enrich_recommendations
+    )
 
 
 @router.get("/briefs/weekly")
-async def briefs_weekly(days: int = Query(7, description="Rolling window in days (7, 30, or 90)")):
-    return await get_weekly_brief_payload(days=days)
+async def briefs_weekly(
+    property_id: str | None = Query(None, description="Scope snapshot to this property UUID"),
+    days: int = Query(7, description="Rolling window in days (7, 30, or 90)"),
+    enrich: bool = Query(
+        True,
+        description="If false, return rule-based brief only (no OpenAI; faster).",
+    ),
+):
+    return await get_weekly_brief_payload(
+        property_id=property_id, days=days, use_llm=enrich
+    )
 
 
 @router.get("/integrations")
@@ -100,3 +126,9 @@ async def ui_header():
 @router.get("/ui/navigation")
 async def ui_navigation():
     return await get_navigation_payload()
+
+
+@router.get("/ui/home-copy")
+async def ui_home_copy():
+    """Template copy + empty home shell for client fallback (DB + JSON merge)."""
+    return await get_home_ui_copy_payload()

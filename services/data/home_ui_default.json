@@ -1,0 +1,112 @@
+{
+  "locale": {
+    "dateLocale": "en-US",
+    "headerTimeZone": "America/New_York"
+  },
+  "greetings": {
+    "morning": "Good morning",
+    "afternoon": "Good afternoon",
+    "evening": "Good evening"
+  },
+  "errors": {
+    "serverUnreachable": "Server unreachable. Showing empty state data.",
+    "sectionUnavailable": "This section could not be loaded."
+  },
+  "labels": {
+    "channelSms": "SMS",
+    "channelEmail": "Email",
+    "channelPhone": "Phone",
+    "heatHot": "Hot",
+    "heatWarm": "Warm",
+    "riskHigh": "High risk",
+    "riskMedium": "Medium risk",
+    "blockerBlocking": "Blocking",
+    "blockerWarning": "Warning",
+    "priorityCritical": "Critical",
+    "priorityHigh": "High",
+    "mentionsSuffix": "mentions",
+    "summaryUnits": "Units",
+    "summaryProperties": "Properties",
+    "summaryLeads": "Leads",
+    "trendLabelFallback": "Trend",
+    "readFullBriefFallback": "Read full brief",
+    "viewAllFallback": "View all",
+    "openQueueFallback": "Open queue",
+    "openInsightsFallback": "Open insights"
+  },
+  "headerSubtext": "Portfolio pulse and action queue (live)",
+  "links": {
+    "fullBriefPath": "/ai"
+  },
+  "dailyAiBrief": {
+    "title": "Daily AI Brief",
+    "subtitle": "What changed recently",
+    "fullBriefLinkLabel": "Read full brief",
+    "fallbackParagraphs": [
+      {
+        "body": "Portfolio snapshot: {vac_n} vacant units in view, {hot_n} hot leads, {followup_n} leads in the follow-up queue."
+      },
+      {
+        "body": "Prioritize repricing and outreach where vacancy days are elevated and tour volume is misaligned with applications."
+      }
+    ]
+  },
+  "priorityActions": {
+    "title": "Priority Actions",
+    "subtitle": "Top items derived from current inventory + pipeline",
+    "items": [
+      {
+        "id": "pa-1",
+        "tag": "high",
+        "icon": "AlertTriangle",
+        "title": "Stabilize high-risk vacant inventory",
+        "lines": ["{at_risk_n} units flagged at-risk in the current window."]
+      },
+      {
+        "id": "pa-2",
+        "tag": "high",
+        "icon": "Sparkles",
+        "title": "Accelerate follow-ups on hot pipeline leads",
+        "lines": ["{hot_n} leads are currently marked hot."]
+      }
+    ]
+  },
+  "atRiskUnits": {
+    "title": "At-Risk Units",
+    "subtitle": "Units needing intervention",
+    "summaryLabel": "Units",
+    "ctaPath": "/packages",
+    "ctaLabel": "View all",
+    "vacantLabelTemplate": "{days} days vacant",
+    "reasonFallback": "Vacancy pressure in current window."
+  },
+  "launchBlockers": {
+    "title": "Launch Blockers",
+    "subtitle": "Items delaying activation",
+    "summaryLabel": "Properties",
+    "ctaPath": "/properties",
+    "ctaLabel": "View all",
+    "issueDefault": "Onboarding checklist incomplete",
+    "detailFallback": "Resolve onboarding blockers to go live."
+  },
+  "followUpQueue": {
+    "title": "Follow-Up Queue",
+    "subtitle": "Leads requiring touchpoints",
+    "summaryLabel": "Leads",
+    "ctaPath": "/users",
+    "ctaLabel": "Open queue",
+    "detailFallback": "Follow up recommended."
+  },
+  "tourInsights": {
+    "title": "Tour Insights",
+    "subtitle": "Recent tour signal volume by property",
+    "trendValue": "Live",
+    "trendLabelTemplate": "Last {d} days",
+    "rowTextTemplate": "Tour-related activity in the last {d} days.",
+    "tourMentionsLowThreshold": 3,
+    "recommendedActionTitle": "Recommended action",
+    "recommendedActionBody": "Tune tour scheduling and follow-up scripts for properties with low tour mentions.",
+    "ctaPath": "/analytics",
+    "ctaLabel": "Open insights"
+  }
+}

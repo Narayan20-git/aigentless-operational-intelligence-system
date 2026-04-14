@@ -93,6 +93,13 @@ DDL_STATEMENTS = [
     );
     """,
     """
+    create table if not exists public.dashboard_home_ui (
+      id text primary key default 'default',
+      copy_json jsonb not null default '{}'::jsonb,
+      updated_at timestamptz not null default now()
+    );
+    """,
+    """
     create table if not exists public.floorplans (
       id uuid default gen_random_uuid(),
       created_at timestamptz not null default now(),
