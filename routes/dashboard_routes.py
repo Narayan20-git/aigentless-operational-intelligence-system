@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from config.database import db_is_ready, startup_database
 from services.dashboard_service import (
+    get_brief_objection_detail_payload,
     get_home_payload,
     get_home_ui_copy_payload,
     get_header_payload,
@@ -107,13 +108,44 @@ async def portfolio_overview(
 async def briefs_weekly(
     property_id: str | None = Query(None, description="Scope snapshot to this property UUID"),
     days: int = Query(7, description="Rolling window in days (7, 30, or 90)"),
+    start_date: str | None = Query(
+        None, description="Optional custom range start date (YYYY-MM-DD)"
+    ),
+    end_date: str | None = Query(
+        None, description="Optional custom range end date (YYYY-MM-DD)"
+    ),
     enrich: bool = Query(
         True,
         description="If false, return rule-based brief only (no OpenAI; faster).",
     ),
 ):
     return await get_weekly_brief_payload(
-        property_id=property_id, days=days, use_llm=enrich
+        property_id=property_id,
+        days=days,
+        start_date=start_date,
+        end_date=end_date,
+        use_llm=enrich,
+    )
+
+
+@router.get("/briefs/objection-detail")
+async def brief_objection_detail(
+    topic: str = Query(..., description="Objection topic label"),
+    property_id: str | None = Query(None, description="Scope snapshot to this property UUID"),
+    days: int = Query(7, description="Rolling window in days"),
+    start_date: str | None = Query(
+        None, description="Optional custom range start date (YYYY-MM-DD)"
+    ),
+    end_date: str | None = Query(
+        None, description="Optional custom range end date (YYYY-MM-DD)"
+    ),
+):
+    return await get_brief_objection_detail_payload(
+        topic=topic,
+        property_id=property_id,
+        days=days,
+        start_date=start_date,
+        end_date=end_date,
     )
 
 

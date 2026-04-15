@@ -1,4 +1,4 @@
-"""Lesa AI tab: OpenAI generates the weekly brief JSON from a compact DB digest (fast path)."""
+"""Lesa AI tab: OpenAI generates period brief JSON from a compact DB digest (fast path)."""
 
 from __future__ import annotations
 
@@ -178,12 +178,12 @@ def _normalize_lesa_payload(llm: Any, fallback: dict[str, Any]) -> dict[str, Any
     return out
 
 
-_SYSTEM_PROMPT = """You output one JSON object for an operator-facing "Weekly Operator Brief" UI.
+_SYSTEM_PROMPT = """You output one JSON object for an operator-facing "Operator Brief" UI.
 
 Hard rules:
 - Use ONLY numbers, names, and themes present in database_digest. Never invent properties, units, people, or counts.
 - Executive summary: 2–4 paragraphs; optional "lead" per paragraph for a bold first clause; weave occupancy estimate, tour/application signals, named properties from digest, and feedback themes when relevant.
-- wins.title must be "Biggest Wins"; blockers.title "Biggest Blockers"; objections.title "Top Objections This Week"; nextActions.title "Recommended Next Actions"; page.title "Weekly Operator Brief".
+- wins.title must be "Biggest Wins"; blockers.title "Biggest Blockers"; objections.title should match selected period wording from digest.window_days; nextActions.title "Recommended Next Actions"; page.title should match selected period wording from digest.window_days.
 - For objections.items: prefer feedback.objection_themes_from_feedback (topic + mentions). If that list is empty, derive topics from funnel_top_events with the same total event volume implied by digest.
 - briefWeekLabel should match week_range_label in digest when provided.
 - No markdown, no code fences in the JSON values.
