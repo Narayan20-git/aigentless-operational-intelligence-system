@@ -1,3 +1,4 @@
+import json
 import os
 import random
 import uuid
@@ -676,8 +677,54 @@ def _seed(conn: psycopg.Connection) -> None:
                     floorplan_ids[i % len(floorplan_ids)],
                     "tour_feedback",
                     bid,
-                ),
-            )
+                    ),
+                )
+
+        # Per-floorplan unit feedback (inventory detail popup shows last 5 by floorplan_id).
+        _unit_fb_templates: list[dict] = [
+            {
+                "rating": 4,
+                "notes": "Liked layout; comparing to one other community this week.",
+                "likes": ["Open kitchen", "Balcony size"],
+                "improvements": [],
+            },
+            {
+                "rating": 3,
+                "notes": "Concerned about natural light in the main living area.",
+                "likes": ["Bedroom dimensions"],
+                "improvements": ["Brightness in living room", "Closet depth"],
+            },
+            {
+                "rating": 5,
+                "notes": "Strong interest — requested pricing on shorter lease term.",
+                "likes": ["Finishes", "Noise level"],
+                "improvements": [],
+            },
+            {
+                "rating": 2,
+                "notes": "Bathroom felt tight vs expectations from photos.",
+                "likes": ["Location"],
+                "improvements": ["Bathroom layout", "Storage"],
+            },
+            {
+                "rating": 4,
+                "notes": "Would revisit if similar unit on higher floor becomes available.",
+                "likes": ["View from bedroom"],
+                "improvements": ["Elevator wait at peak"],
+            },
+        ]
+        for fp_idx, fpid in enumerate(floorplan_ids):
+            for j in range(5):
+                tpl = _unit_fb_templates[j % len(_unit_fb_templates)]
+                created = datetime.now(UTC) - timedelta(days=j * 4 + (fp_idx % 5), hours=(fp_idx + j * 3) % 20)
+                pr = prospect_ids[(fp_idx * 7 + j * 3) % len(prospect_ids)]
+                cur.execute(
+                    """
+                    insert into feedback (profile_id, raw_feedback, floorplan_id, type, booking_id, created_at)
+                    values (%s,%s::jsonb,%s,%s,%s,%s)
+                    """,
+                    (str(pr), json.dumps(tpl), str(fpid), "Unit", None, created),
+                )
 
         for i, tid in enumerate(tour_ids, start=1):
             for j in range(1, 3):

@@ -17,7 +17,7 @@ import os
 import time
 from collections import Counter, defaultdict
 from datetime import UTC, date, datetime, timedelta
-from typing import Any
+from typing import Any, Optional
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
@@ -531,37 +531,39 @@ def _inventory_unit_guidance(
     apps: int,
     conv_pct: float,
     unit_type: str,
+    unit_code: str,
+    property_name: str,
 ) -> tuple[str, str]:
     """Generate unit-specific why/action copy from live signals."""
+    who = f"Unit {unit_code} at {property_name}" if property_name else f"Unit {unit_code}"
     if tours >= 3 and apps == 0:
         return (
-            f"{tours} tours in the last {window_days} days but zero applications indicates a conversion blocker.",
-            "Review tour script + qualification flow, then launch a 7-day offer/CTA test to recover applications.",
+            f"{who}: {tours} tours in the last {window_days} days but zero applications indicates a conversion blocker.",
+            f"For {unit_code}: review tour script and qualification, then run a 7-day offer/CTA test to recover applications.",
         )
     if vacancy_days >= max(5, int(window_days * 0.55)) and conv_pct < 60:
         return (
-            f"{unit_type} inventory has been vacant for {vacancy_days} days with low conversion ({int(round(conv_pct))}%).",
-            "Run a pricing refresh and update listing media this week; prioritize this unit in follow-up campaigns.",
+            f"{who} ({unit_type}) has been vacant {vacancy_days} days with low conversion ({int(round(conv_pct))}%).",
+            f"For {unit_code} at {property_name}: refresh pricing and listing media this week; prioritize this unit in follow-up.",
         )
     if conv_pct < 45:
         return (
-            f"Tour-to-application conversion is critically low at {int(round(conv_pct))}% in the current window.",
-            "Audit objections from recent tours and adjust positioning, incentives, and lead qualification rules.",
+            f"{who}: tour-to-application conversion is critically low at {int(round(conv_pct))}% in the current window.",
+            f"For {unit_code}: audit objections from recent tours; adjust positioning, incentives, and lead qualification.",
         )
     if status == "stale":
         if tours <= 2:
             return (
-                f"Demand is soft for this unit ({tours} tours in {window_days} days), slowing pipeline momentum.",
-                "Increase exposure on high-performing channels and test alternative headline/hero-photo combinations.",
+                f"{who}: demand is soft ({tours} tours in {window_days} days), slowing pipeline momentum.",
+                f"For {unit_code}: increase exposure on strong channels; test alternative headline and hero photo.",
             )
         return (
-            f"Engagement is present ({tours} tours) but conversion ({int(round(conv_pct))}%) is below healthy target.",
-            "Tighten follow-up timing and test 1-2 incentive variants to improve application completion.",
+            f"{who}: engagement exists ({tours} tours) but conversion ({int(round(conv_pct))}%) is below healthy target.",
+            f"For {unit_code}: tighten follow-up timing; test one or two incentive variants to lift applications.",
         )
-    # healthy fallback
     return (
-        f"This unit is converting well ({apps}/{tours} from tours to applications) in the last {window_days} days.",
-        "Maintain current strategy and monitor weekly; replicate this unit's messaging on similar floorplans.",
+        f"{who} is converting well ({apps} apps / {tours} tours) in the last {window_days} days.",
+        f"For {unit_code}: keep current strategy and monitor weekly; mirror this unit's messaging on similar floorplans.",
     )
 
 
@@ -889,6 +891,7 @@ def _gemini_guidance_from_feedback(
             "Return valid JSON with keys: why_matters, recommended_action.",
             "Each field max 180 chars.",
             "No markdown, no bullets, no extra keys.",
+            "Both fields MUST name this exact unit: include unit_code and property_name (not generic floorplan-only wording).",
         ],
         "unit_context": {
             "unit_code": unit_code,
@@ -1226,6 +1229,8 @@ def _build_inventory_vacant_sync(property_id: str | None = None, days: int = 7) 
                 apps=apps_n,
                 conv_pct=conv_float,
                 unit_type=utype,
+                unit_code=str(u.get("unit") or uid[:8]),
+                property_name=pname,
             )
             why_matters, recommended_action = _gemini_guidance_from_feedback(
                 unit_code=str(u.get("unit") or uid[:8]),
@@ -1283,6 +1288,132 @@ def _build_inventory_vacant_sync(property_id: str | None = None, days: int = 7) 
         "window_days": days,
         "period_start": since.isoformat(),
     }
+
+
+def _feedback_plain_text_for_inventory(raw: Any) -> str:
+    """Human-readable summary for feedback.raw_feedback (string or JSON object)."""
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw.strip()[:800]
+    if not isinstance(raw, dict):
+        return str(raw).strip()[:800]
+    chunks: list[str] = []
+    notes = raw.get("notes")
+    if notes and str(notes).strip():
+        chunks.append(str(notes).strip())
+    rating = raw.get("rating")
+    if rating is not None and str(rating).strip() != "":
+        chunks.append(f"Rating: {rating}")
+    for key in ("likes", "improvements"):
+        arr = raw.get(key) or []
+        if isinstance(arr, list):
+            for x in arr[:8]:
+                s = str(x or "").strip()
+                if s:
+                    chunks.append(s)
+    for key in ("additionalCommentsLikes", "additionalCommentsImprovements", "dislikes"):
+        c = str(raw.get(key) or "").strip()
+        if len(c) > 3:
+            chunks.append(c[:400])
+    if chunks:
+        return " · ".join(chunks)[:800]
+    try:
+        return json.dumps(raw, ensure_ascii=True, default=str)[:800]
+    except Exception:
+        return ""
+
+
+def _inventory_unit_detail_sync(unit_id: str) -> Optional[dict[str, Any]]:
+    """Unit record + space row + last 5 feedback rows for the unit's floorplan (tour / unit feedback)."""
+    client = get_client()
+    uid = (unit_id or "").strip()
+    if not uid:
+        return None
+    ur = (
+        client.table("units")
+        .select("id,unit,property_id,floorplan_id,created_at,move_in_date")
+        .eq("id", uid)
+        .limit(1)
+        .execute()
+    )
+    rows = ur.data or []
+    if not rows:
+        return None
+    u = rows[0]
+    pid = str(u.get("property_id") or "")
+    fp = str(u.get("floorplan_id") or "")
+    prop_name = "Property"
+    if pid:
+        try:
+            pr = client.table("properties").select("id,name").eq("id", pid).limit(1).execute()
+            prows = pr.data or []
+            if prows:
+                prop_name = str(prows[0].get("name") or prop_name).strip() or prop_name
+        except Exception:
+            pass
+
+    space_out: Optional[dict[str, Any]] = None
+    try:
+        sr = (
+            client.table("spaces")
+            .select("available_date,availability_status,created_at")
+            .eq("unit_id", uid)
+            .limit(1)
+            .execute()
+        )
+        if sr.data:
+            s0 = sr.data[0]
+            space_out = {
+                "availableDate": s0.get("available_date"),
+                "availabilityStatus": s0.get("availability_status"),
+                "createdAt": s0.get("created_at"),
+            }
+    except Exception:
+        pass
+
+    feedback_items: list[dict[str, Any]] = []
+    if fp:
+        try:
+            fr = (
+                client.table("feedback")
+                .select("id,type,created_at,raw_feedback,booking_id")
+                .eq("floorplan_id", fp)
+                .order("created_at", desc=True)
+                .limit(5)
+                .execute()
+            )
+            for r in fr.data or []:
+                feedback_items.append(
+                    {
+                        "id": str(r.get("id") or ""),
+                        "type": str(r.get("type") or ""),
+                        "createdAt": r.get("created_at"),
+                        "bookingId": str(r.get("booking_id") or "") or None,
+                        "summary": _feedback_plain_text_for_inventory(r.get("raw_feedback")),
+                    }
+                )
+        except Exception:
+            pass
+
+    br = _floorplan_bedrooms_map(client, [fp]).get(fp, "1") if fp else ""
+
+    return {
+        "unitId": uid,
+        "unitCode": str(u.get("unit") or uid[:8]),
+        "propertyId": pid or None,
+        "propertyName": prop_name,
+        "floorplanId": fp or None,
+        "bedroomsLabel": f"{br} BR" if br else None,
+        "moveInDate": u.get("move_in_date"),
+        "unitCreatedAt": u.get("created_at"),
+        "space": space_out,
+        "feedbacks": feedback_items,
+    }
+
+
+async def get_inventory_unit_detail_payload(unit_id: str) -> Optional[dict[str, Any]]:
+    return await asyncio.to_thread(_inventory_unit_detail_sync, unit_id)
 
 
 def _list_property_options_sync() -> list[dict[str, str]]:

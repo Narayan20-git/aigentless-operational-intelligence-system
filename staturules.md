@@ -1,180 +1,130 @@
-# Status Rules by Page
+# Status rules by page
 
-This document lists all runtime status/badge values currently used across dashboard pages, with their generation logic and data source.
-
-## 1) Lead Prioritization (`/users`)
-
-### Badge: Lead Heat (`hot`, `warm`, `cold`)
-- **Data source:** `prospect_events` + `bookings` (scoped to selected `days` window)
-- **Backend rule location:** `services/dashboard_service.py` (`_heat_from_engagement`)
-- **Logic:**
-  - `cold` if no events in window and no booking in window.
-  - `hot` if any of:
-    - has booking in window, or
-    - events in window >= 3, or
-    - last activity < 24h
-  - `warm` if any of:
-    - events in window >= 1, or
-    - last activity < 7 days
-  - else `cold`
-
-### Badge: Lead Priority (`critical`, `moderate`, `low`)
-- **Data source:** `prospects.applied`, `prospects.leased`
-- **Backend rule location:** `services/dashboard_service.py` (`_priority_from_flags`)
-- **Logic:**
-  - `critical` => `applied = false` and `leased = false`
-  - `moderate` => `applied = true` and `leased = false`
-  - `low` => otherwise (leased true)
-
-### UI-only display mapping
-- **Frontend location:** `Aileasingintelligencedashboard/src/pages/UsersPage.tsx`
-- Heat badge colors map directly from backend heat.
-- Priority badge icon/text maps directly from backend priority.
+Each section follows: **Page** → **Card** → **status badge** → **rules** (data source and logic). Paths refer to this repo (`aigentless-operational-intelligence-system`) and the dashboard app (`Aileasingintelligencedashboard`).
 
 ---
 
-## 2) Inventory Intelligence (`/packages`)
+## Home (`/`)
 
-### Badge: Unit Status (`atRisk`, `stale`, `healthy`)
-- **Data source:** inventory signals computed from:
-  - tours count in window
-  - applications count in window
-  - conversion %
-  - vacancy days
-  - selected window (`7/30/90`)
-- **Backend rule location:** `services/dashboard_service.py` (`_inventory_status_from_signals`)
-- **Logic (ordered):**
-  - `atRisk` if `tours >= 3` and `apps == 0`
-  - `atRisk` if long window (90d) and `vacancy_days >= 30` and `conv_pct < 75`
-  - `atRisk` if `vacancy_days >= max(5, int(window_days * 0.55))` and conversion below window cutoff:
-    - 7d cutoff: `< 55`
-    - 30d cutoff: `< 60`
-    - 90d cutoff: `< 68`
-  - `atRisk` if `conv_pct < 45`
-  - `stale` if `45 <= conv_pct < 75`
-  - `healthy` if `conv_pct >= 75`
+### Daily AI Brief
+- **Status badge:** *(none — narrative only)*
+- **Rules:** Copy comes from home UI template (`dailyAiBrief` in Supabase-loaded JSON via `load_home_ui_copy`). Fallback paragraphs are merged into **one** paragraph, `lead` stripped, and placeholders filled with `format_template` (`vac_n`, `hot_n`, `followup_n`, `at_risk_n`, `d`). Optional LLM rewrite: `services/home_llm.py` (`enrich_home_narrative_llm`) using metrics from `services/live_ui_payloads.py` (`build_home_payload_from_parts`). Frontend renders a single `<p>` from joined `paragraphs[].body` — `Aileasingintelligencedashboard/src/pages/HomePage.tsx`.
 
-### UI-only display mapping
-- **Frontend location:** `Aileasingintelligencedashboard/src/pages/PackagesPage.tsx`
-- `atRisk` -> badge text `critical`
-- `stale` -> badge text `attention`
-- `healthy` -> badge text `healthy`
+### Priority Actions
+- **Status badge:** `Critical` | `High` (pill)
+- **Rules:** Items from template `priorityActions.items`; each `tag` is passed through (`high` → **High**, anything else → **Critical** on the client). `ctaPath` defaults from title keywords (inventory → `/packages`, follow-up/pipeline/leads → `/users`, onboarding/blocker/launch → `/properties`, else `/analytics`). Rows are **full-row links** to `ctaPath`. **UI:** list preview capped at **5** rows (`HOME_LIST_PREVIEW_MAX`); header counts use API totals, not preview length.
 
----
+### At-risk units (portfolio strip)
+- **Status badge:** `high` | `medium` (risk pill — labels from `ui.labels`, e.g. High / Medium)
+- **Rules:** Built in `build_home_payload_from_parts`. Includes a vacant unit if `status == "atRisk"` **or** `days >= 10`. **`high`** if inventory `status == "atRisk"`; else **`medium`**. `reason` from unit `whyMatters` or template fallback. Summary value = count of included units (up to 20 built server-side; UI shows first 5). CTA default `/packages`.
 
-## 3) Property Onboarding (`/properties`)
+### Launch blockers
+- **Status badge:** `blocking` (and client supports `warning`, but live payload uses `blocking`)
+- **Rules:** From onboarding payload: property included if onboarding `status == "blocked"` **or** `blockers` non-empty. `tag` emitted as **`blocking`**. `percent` from onboarding completeness. Summary = count of such properties. CTA default `/properties`.
 
-### Badge: Property Status (`ready`, `in-progress`, `blocked`)
-- **Data source:** onboarding payload from backend.
-- **Backend normalization location:** `services/live_ui_payloads.py` (`_normalize_onboarding_status_ui`)
-- **Logic:**
-  - Raw `ready` -> `ready`
-  - Raw `blocked` -> `blocked`
-  - everything else -> `inProgress` (payload format)
+### Follow-up queue
+- **Status badge:** `hot` | `warm` (heat pill; `cold` is not shown — see rules)
+- **Rules:** Rows from leads summary `data` (prospects with a tour). Backend sets `heat` from lead `status` (`hot` vs else → **`warm`**; **`cold` becomes `warm`** in `build_home_payload_from_parts`). Channel alternates by row index (`sms` / `email`). Summary = row count. CTA default `/users`.
 
-### Heuristic fallback when onboarding table data is missing
-- **Backend location:** `services/live_ui_payloads.py` (`_heuristic_onboarding_row`)
-- **Inputs:** `properties.go_live_date` + deterministic seed from property id
-- **Logic:**
-  - go-live <= -7 days -> `ready` with ~90-99 completeness
-  - go-live <= +14 days -> `in-progress` with ~62-86 completeness
-  - go-live farther future -> `blocked` with ~35-54 completeness
-  - no parseable date -> `in-progress` with ~40-69 completeness
-
-### UI-only display mapping
-- **Frontend location:** `Aileasingintelligencedashboard/src/pages/PropertiesPage.tsx`
-- `ready`, `in-progress`, `blocked` mapped to colored pills.
+### Tour Insights
+- **Status badge:** Row tone `positive` | `negative` (icon circle: thumbs up / thumbs down; not a text pill)
+- **Header trend:** `trendValue` e.g. `+12%` or `-5%` — **green / red** and up/down icon from sign; compares tour-related event count in the current window to the **prior window of equal length**.
+- **Rules:** `prospect_events` with `"tour"` in `event`, grouped by `property_id`. `tourMentionsLowThreshold` (default **3**): `mentions < threshold` → **`negative`** tone and “below typical” copy; else **`positive`**. Subtitle from template with `{d}` and `{tour_total}`. Recommended action title/body from template, optionally replaced by `enrich_home_narrative_llm`. CTA default `/ai`.
 
 ---
 
-## 4) Portfolio Overview (`/analytics`)
+## Lead Prioritization (`/users`)
 
-### Badge: Property Rating (`Excellent`, `Good`, `Needs Attention`)
-- **Data source:** `properties`, `units`, and inventory `vacantUnits` metrics
-- **Backend rule location:** `services/live_ui_payloads.py`
-  - score calc in `build_portfolio_overview_from_inv`
-  - rating thresholds in `_portfolio_rating_from_signals`
-- **Health score formula:**
-  - `health = round(58 + 0.5*conversion - 2.0*vacancy_rate + min(12, tours*0.6))`
-  - clamped to `45..98`
-- **Rating thresholds:**
-  - `health >= 92` => `Excellent`
-  - `health >= 82` => `Good`
-  - else => `Needs Attention`
+### Lead list row — Heat
+- **Status badge:** `hot` | `warm` | `cold`
+- **Rules:** `services/dashboard_service.py` — `_heat_from_engagement(events_in_window, last_ts, created, has_booking_in_window)`. **`cold`** if no events in window and no booking in window. **`hot`** if booking in window, or events in window ≥ 3, or last activity within 24 hours. **`warm`** if events ≥ 1 or last activity within 7 days. Otherwise **`cold`**. UI: `Aileasingintelligencedashboard/src/pages/UsersPage.tsx` (`HeatPill`, filters).
 
-### Internal status used by UI cards
-- **Backend location:** same function above
-- **Logic:**
-  - `status = healthy` for ratings `Excellent` and `Good`
-  - `status = attention` for rating `Needs Attention`
+### Lead list row — Priority
+- **Status badge:** `critical` | `moderate` | `low` (pill)
+- **Rules:** For each row appended in `_build_leads_summary_sync`, `priority = "critical" if has_toured else "moderate"` with `has_toured = True` for all rows that pass the filter (prospects without a resolved tour timestamp are **skipped**). So **currently all listed leads emit `critical`** for priority. `_priority_from_flags` exists in the same file but is **not** called by this pipeline. Unknown API values normalize to **`low`** in the client.
 
-### Portfolio recommendations priority tags (same page, lower section)
-- **Source:** LLM (`_llm_portfolio_recommendations`) or fallback
-- **Backend location:** `services/live_ui_payloads.py`
-- **Tag mapping from LLM `priority`:**
-  - `high` -> `High priority` (red)
-  - `opportunity` -> `Opportunity` (green)
-  - default -> `Medium priority` (yellow)
+### Lead detail / AI fields
+- **Status badge:** *(none beyond heat + priority)*
+- **Rules:** When `OPENAI_API_KEY` is set, `enrich_leads_summary_rows` (`services/lead_card_llm.py`) fills recommended actions, drafts, etc.; timing phrasing (e.g. follow-up cadence) is model-guided, not a fixed “email in N days” rule in code.
 
 ---
 
-## 5) Home Dashboard (`/`)
+## Inventory Intelligence (`/packages`)
 
-### Badge: At-Risk Units card (`high`, `medium`)
-- **Data source:** inventory `vacantUnits` (`status`, `days`, `whyMatters`)
-- **Backend location:** `services/live_ui_payloads.py` (`build_home_payload_from_parts`)
-- **Inclusion logic:**
-  - include unit if `status == atRisk` OR `days >= 10`
-- **Risk badge logic:**
-  - `high` if `status == atRisk`
-  - else `medium`
+### Vacant unit row — Status
+- **Status badge (API):** `atRisk` | `stale` | `healthy` → **UI labels:** `critical` | `attention` | `healthy`
+- **Rules:** `services/dashboard_service.py` — `_inventory_status_from_signals(conv_pct, vacancy_days, window_days, tours, apps)` (ordered checks):  
+  - **`atRisk`** if `tours >= 3` and `apps == 0`  
+  - **`atRisk`** if `window_days >= 90` and `vacancy_days >= 30` and `conv_pct < 75`  
+  - **`atRisk`** if `vacancy_days >= max(5, int(window_days * 0.55))` and conversion below cutoff: **55** (7d), **60** (30d), **68** (90d)  
+  - **`atRisk`** if `conv_pct < 45`  
+  - **`stale`** if `45 <= conv_pct < 75`  
+  - **`healthy`** if `conv_pct >= 75`  
+  UI: `PackagesPage.tsx` (`StatusBadge`, `DetailStatusBadge`).
 
-### Badge: Follow-Up Queue heat (`hot`, `warm`)
-- **Data source:** leads summary rows (`status`)
-- **Backend location:** same function above
-- **Logic:**
-  - `hot` if lead status is exactly `hot`
-  - else `warm` (cold leads are currently coerced to warm for this widget)
+### KPI / filter chips (counts)
+- **Status badge:** Counts by `atRisk` / `stale` / `healthy` (same semantics as unit status)
+- **Rules:** Client aggregates `vacantUnits` for summary cards and status filter tabs.
 
-### Badge: Launch Blockers tag (`blocking`)
-- **Data source:** onboarding payload (`status`, `blockers`)
-- **Backend location:** same function above
-- **Logic:**
-  - include property when onboarding status is `blocked` OR blockers list is non-empty
-  - emitted tag is `blocking`
-
-### Badge: Tour Insights tone (`positive`, `negative`)
-- **Data source:** `prospect_events` tour mentions grouped by property
-- **Backend location:** same function above
-- **Logic:**
-  - `negative` if mentions < threshold
-  - `positive` otherwise
-  - threshold from template `tourMentionsLowThreshold` (default `3`)
-
-### Priority Actions chip (`Critical` / `High`) mapping
-- **Data source:** template JSON (`home_ui_copy`) `priorityActions.items[].tag`
-- **Backend:** passes tag through
-- **Frontend location:** `Aileasingintelligencedashboard/src/pages/HomePage.tsx`
-- **Mapping:**
-  - tag `high` -> chip label `High`
-  - any other value -> chip label `Critical`
+### Unit detail / “View full details”
+- **Status badge:** Same unit status as row
+- **Rules:** Extra fields and recent feedbacks from `GET /inventory/vacant-units/{unit_id}/detail` (`routes/dashboard_routes.py`, `dashboard_service._inventory_unit_detail_sync`). Guidance copy aligns with `_inventory_unit_guidance` in `dashboard_service.py`.
 
 ---
 
-## 6) Weekly Brief (`/ai`)
+## Property Onboarding (`/properties`)
 
-### Status-like fields
-- No strict operational status badge set (like hot/warm/atRisk) is computed for this page.
-- The page uses semantic sections (`wins`, `blockers`, `objections`) from:
-  - fallback rule-based digest (`build_weekly_brief`)
-  - or LLM enrichment (`enrich_lesa_ai_page`)
+### Property list row — Launch status
+- **Status badge:** `blocked` | `in-progress` | `ready`
+- **Rules:** Payload from `build_onboarding_payload` / normalization `services/live_ui_payloads.py` (`_normalize_onboarding_status_ui`): raw **`ready`** → ready; **`blocked`** → blocked; else → **in progress** (internal `inProgress`; UI hyphen **`in-progress`**). If DB onboarding is thin, `_heuristic_onboarding_row` can synthesize status from `go_live_date` and deterministic spread. UI: `PropertiesPage.tsx` (`StatusBadge`).
+
+### Summary metric cards (Ready / In Progress / Blocked / Avg completeness / Lead events)
+- **Status badge:** *(numeric / label cards, not risk pills)*
+- **Rules:** Counts and averages from onboarding rows in `build_onboarding_payload` output.
 
 ---
 
-## Notes
+## Portfolio Overview (`/analytics`)
 
-- For canonical operational statuses, backend is source-of-truth:
-  - Lead heat/priority: `services/dashboard_service.py`
-  - Inventory unit risk status: `services/dashboard_service.py`
-  - Onboarding and portfolio runtime status/rating: `services/live_ui_payloads.py`
-- Some pages apply UI label remapping (`atRisk` -> `critical`, etc.) in frontend for presentation only.
+### Metric cards (Occupancy, Tour to App avg, Avg vacancy days)
+- **Status badge:** *(none)*
+- **Rules:** `build_portfolio_overview_from_inv` in `live_ui_payloads.py` — occupancy from units + vacant inventory; avg conversion and vacancy days from vacant-unit sample.
+
+### Property cards — Health / rating
+- **Status badge (UI):** `PropertyStatusBadge` maps API `status` → pill text: **`healthy`** → “Excellent”, **`watch`** → “Good”, **`attention`** → “Needs Attention” (`AnalyticsPage.tsx`).
+- **Rules:** Per-property **`raw_health`** = `74 + 0.65*conv_delta - 2.2*max(0,vac_delta) - 0.9*vacancy_rate + min(8, tours*0.35)` (vs portfolio averages), clamped to **45–98** as `base_health`. Properties sorted by `raw_health`; **top ~35%** → payload **`rating` “Excellent”**, **`status` `healthy`**, health forced ≥ 88; **bottom ~25%** → **`rating` “Needs Attention”**, **`status` `attention`**, health capped ≤ 79; **middle** → **`rating` “Good”**, **`status` `healthy`**, health ~80–89. The API also exposes string **`rating`** for Excellent vs Good; the current grid badge reads only **`status`**, and both top and middle tiers use **`healthy`**, so “Good” vs “Excellent” may not differ in the pill until the client uses **`rating`**. **`_portfolio_rating_from_signals`** exists but is **not** used in this builder.
+
+### AI Recommendations list
+- **Status badge:** Tag pills e.g. **High priority** (red), **Opportunity** (green), **Medium priority** (yellow)
+- **Rules:** Prefer OpenAI JSON (`_llm_portfolio_recommendations`): maps LLM `priority` **`high`** → High priority, **`opportunity`** → Opportunity, else Medium priority. If LLM skipped (no key, `SKIP_PORTFOLIO_RECS_LLM`, or error), `_fallback_portfolio_recommendations` uses non-healthy properties and tags **High priority**.
+
+---
+
+## Lesa AI — Weekly Operator Brief (`/ai`)
+
+### Executive Summary, Wins, Blockers, Objections, Next Actions
+- **Status badge:** *(none — section copy and bullets)*
+- **Rules:** Payload from weekly brief builder (`build_weekly_brief` in `live_ui_payloads.py`) and optional LLM enrichment (`enrich_lesa_ai_page` if configured). No `hot` / `atRisk`-style enum for this page.
+
+---
+
+## Settings (`/settings`) and Profile (`/profile`)
+
+### Page-level
+- **Status badge:** *(none documented)*
+- **Rules:** Static UI; no shared operational status pipeline with the dashboard services above.
+
+---
+
+## Source-of-truth quick map
+
+| Area | Primary backend |
+|------|-----------------|
+| Lead heat | `dashboard_service.py` — `_heat_from_engagement` |
+| Lead row priority (current API) | `dashboard_service.py` — `_build_leads_summary_sync` (not `_priority_from_flags`) |
+| Inventory unit status | `dashboard_service.py` — `_inventory_status_from_signals` |
+| Home widgets + tour trend | `live_ui_payloads.py` — `build_home_payload_from_parts`; narrative LLM — `home_llm.py` |
+| Onboarding list | `live_ui_payloads.py` — onboarding builders + `_normalize_onboarding_status_ui` |
+| Portfolio overview + property rating bands | `live_ui_payloads.py` — `build_portfolio_overview_from_inv` |
+
+Some API values are **relabeled in the browser only** (e.g. inventory `atRisk` → pill text **`critical`**).

@@ -873,11 +873,13 @@ def build_home_payload_from_parts(
             break
 
     ti_tpl = tpl.get("tourInsights") or {}
-    tour_row_tmpl = str(ti_tpl.get("rowTextTemplate") or "Tour-related activity in the last {d} days.")
     tour_low_thr = int(ti_tpl.get("tourMentionsLowThreshold") or 3)
 
     since = datetime.now(UTC) - timedelta(days=d)
+    prev_window_start = since - timedelta(days=d)
     tour_insights: list[dict[str, Any]] = []
+    tour_total_events = 0
+    prev_tour_total_events = 0
     try:
         er = (
             client.table("prospect_events")
@@ -893,6 +895,22 @@ def build_home_payload_from_parts(
                 pid = str(e.get("property_id") or "")
                 if pid:
                     by_prop[pid] += 1
+        tour_total_events = int(sum(by_prop.values()))
+        try:
+            er_prev = (
+                client.table("prospect_events")
+                .select("event")
+                .gte("timestamp", prev_window_start.isoformat())
+                .lt("timestamp", since.isoformat())
+                .limit(2000)
+                .execute()
+            )
+            for row in er_prev.data or []:
+                if "tour" in str(row.get("event") or "").lower():
+                    prev_tour_total_events += 1
+        except Exception:
+            prev_tour_total_events = 0
+
         prop_names: dict[str, str] = {}
         if by_prop:
             ids = list(by_prop.keys())[:40]
@@ -901,17 +919,39 @@ def build_home_payload_from_parts(
                 for r in pr.data or []:
                     prop_names[str(r["id"])] = str(r.get("name") or "Property")
         for pid, mentions in by_prop.most_common(20):
+            pname = prop_names.get(pid, "Property")
+            if mentions >= tour_low_thr:
+                row_text = (
+                    f"Strong tour engagement at {pname}: {mentions} tour-related signals in the last {d} days."
+                )
+            else:
+                row_text = (
+                    f"Tour signals below typical for {pname} ({mentions} mentions in the last {d} days)."
+                )
             tour_insights.append(
                 {
                     "id": f"ti-{pid}",
                     "tone": "negative" if mentions < tour_low_thr else "positive",
-                    "property": prop_names.get(pid, "Property"),
-                    "text": format_template(tour_row_tmpl, {"d": d}),
+                    "property": pname,
+                    "text": row_text,
                     "mentions": mentions,
                 }
             )
     except Exception:
         pass
+
+    if prev_tour_total_events <= 0:
+        trend_pct_display = "+100%" if tour_total_events > 0 else "0%"
+    else:
+        delta_pct = int(round((tour_total_events - prev_tour_total_events) / prev_tour_total_events * 100))
+        trend_pct_display = f"{'+' if delta_pct >= 0 else ''}{delta_pct}%"
+
+    ti_subtitle_tmpl = str(ti_tpl.get("subtitleTemplate") or "Last {d} days • {tour_total} tours analyzed")
+    tour_insights_subtitle = format_template(
+        ti_subtitle_tmpl,
+        {"d": d, "tour_total": tour_total_events},
+    )
+    tour_trend_label = str(ti_tpl.get("trendLabel") or "Tour volume")
 
     fmt_ctx: dict[str, Any] = {
         "vac_n": vac_n,
@@ -954,9 +994,21 @@ def build_home_payload_from_parts(
     brief_paragraphs: list[dict[str, str]] = []
     for p in dab.get("fallbackParagraphs") or []:
         if isinstance(p, dict) and p.get("body"):
-            brief_paragraphs.append({"body": format_template(str(p["body"]), fmt_ctx)})
+            row: dict[str, str] = {"body": format_template(str(p["body"]), fmt_ctx)}
+            lead_raw = p.get("lead")
+            if isinstance(lead_raw, str) and lead_raw.strip():
+                row["lead"] = format_template(lead_raw.strip(), fmt_ctx)
+            brief_paragraphs.append(row)
     if not brief_paragraphs:
         brief_paragraphs = [{"body": format_template("", fmt_ctx)}]
+    # Home card: one short daily brief paragraph (merge template/DB multi-block; drop section leads).
+    if len(brief_paragraphs) > 1:
+        merged_bodies = [str(r.get("body") or "").strip() for r in brief_paragraphs if r.get("body")]
+        brief_paragraphs = [{"body": " ".join(merged_bodies).strip()}] if merged_bodies else brief_paragraphs
+    if brief_paragraphs:
+        one = dict(brief_paragraphs[0])
+        one.pop("lead", None)
+        brief_paragraphs = [one]
 
     links = tpl.get("links") or {}
     full_brief_path = str(links.get("fullBriefPath") or "/ai")
@@ -964,6 +1016,9 @@ def build_home_payload_from_parts(
     tour_rec_title = str(ti_tpl.get("recommendedActionTitle") or "")
     tour_rec_body = str(ti_tpl.get("recommendedActionBody") or "")
 
+    low_tour_props = [str(x.get("property") or "") for x in tour_insights if x.get("tone") == "negative"][:4]
+    high_tour_props = [str(x.get("property") or "") for x in tour_insights if x.get("tone") == "positive"][:4]
+    at_risk_units_sample = [str(u.get("unit") or "") for u in at_risk[:6] if u.get("unit")]
     llm_metrics = {
         "window_days": d,
         "property_scope": property_id or "all_properties",
@@ -972,9 +1027,14 @@ def build_home_payload_from_parts(
         "followup_queue_count": len(followup),
         "at_risk_marked_units": at_risk_n,
         "at_risk_panel_units": len(at_risk),
+        "at_risk_unit_codes_sample": [x for x in at_risk_units_sample if x],
         "launch_blocker_properties": len(launch_items),
         "properties_with_tour_signals": len(tour_insights),
         "properties_low_tour_signal": sum(1 for x in tour_insights if x.get("tone") == "negative"),
+        "tour_events_in_window": tour_total_events,
+        "tour_volume_change_pct_label": trend_pct_display,
+        "sample_low_tour_property_names": low_tour_props,
+        "sample_strong_tour_property_names": high_tour_props,
     }
     brief_paragraphs, tour_rec_title, tour_rec_body = enrich_home_narrative_llm(
         property_id=property_id,
@@ -1033,13 +1093,14 @@ def build_home_payload_from_parts(
         },
         "tourInsights": {
             "title": str(ti_tpl.get("title") or ""),
-            "subtitle": str(ti_tpl.get("subtitle") or ""),
-            "trendValue": str(ti_tpl.get("trendValue") or ""),
-            "trendLabel": format_template(str(ti_tpl.get("trendLabelTemplate") or ""), {"d": d}),
+            "subtitle": tour_insights_subtitle,
+            "trendValue": trend_pct_display,
+            "trendLabel": tour_trend_label,
+            "toursAnalyzedTotal": tour_total_events,
             "items": tour_insights,
             "recommendedActionTitle": tour_rec_title,
             "recommendedActionBody": tour_rec_body,
-            "ctaPath": str(ti_tpl.get("ctaPath") or "/analytics"),
+            "ctaPath": str(ti_tpl.get("ctaPath") or "/ai"),
             "ctaLabel": str(ti_tpl.get("ctaLabel") or ""),
         },
         "ui": {

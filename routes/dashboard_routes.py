@@ -7,6 +7,7 @@ from services.dashboard_service import (
     get_header_payload,
     get_integrations_payload,
     get_inventory_payload,
+    get_inventory_unit_detail_payload,
     get_leads_summary_payload,
     get_navigation_payload,
     get_portfolio_overview_payload,
@@ -70,6 +71,14 @@ async def inventory_vacant_units(
     days: int = Query(7),
 ):
     return await get_inventory_payload(property_id=property_id, days=days)
+
+
+@router.get("/inventory/vacant-units/{unit_id}/detail")
+async def inventory_vacant_unit_detail(unit_id: str):
+    data = await get_inventory_unit_detail_payload(unit_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="Unit not found")
+    return data
 
 
 @router.get("/properties/onboarding")

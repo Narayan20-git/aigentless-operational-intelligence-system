@@ -13,6 +13,24 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+
+def _daily_brief_as_single_paragraph(briefs: list[dict[str, Any]] | None) -> list[dict[str, str]]:
+    """Collapse multi-block / legacy briefs into one body for the home card."""
+    if not briefs:
+        return []
+    parts: list[str] = []
+    for p in briefs:
+        if not isinstance(p, dict):
+            continue
+        b = str(p.get("body") or "").strip()
+        if b:
+            parts.append(b)
+    if not parts:
+        return []
+    text = " ".join(parts)
+    text = " ".join(text.split())[:1200]
+    return [{"body": text.strip()}]
+
 _HOME_LLM_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
 
@@ -64,21 +82,27 @@ def enrich_home_narrative_llm(
     hit = _HOME_LLM_CACHE.get(cache_key)
     if hit and (now - hit[0]) <= _home_llm_cache_ttl_sec():
         data = hit[1]
+        cached_brief = data.get("brief_paragraphs")
+        norm_brief = _daily_brief_as_single_paragraph(cached_brief if isinstance(cached_brief, list) else None)
         return (
-            data.get("brief_paragraphs") or fallback_brief,
+            norm_brief if norm_brief else fallback_brief,
             data.get("tour_title") or fallback_tour_title,
             data.get("tour_body") or fallback_tour_body,
         )
 
     prompt = {
-        "task": "Write dashboard home copy for leasing operators.",
+        "task": (
+            "Write an executive Daily AI Brief for multifamily leasing operators. "
+            "This appears on the home dashboard as a summary; tone is confident and actionable, like a Lesa AI operator brief."
+        ),
         "constraints": [
-            "Use ONLY the numeric facts provided in metrics. Do not invent properties or units.",
+            "Use ONLY facts from metrics (counts, lists, labels). Do not invent property names beyond sample_* lists; if a list is empty, do not name specific properties.",
             "Return valid JSON with keys: brief_paragraphs, tour_recommended_title, tour_recommended_body.",
-            "brief_paragraphs: array of 2 objects, each {\"body\": \"...\"} only (no lead), max 320 chars per body.",
-            "tour_recommended_title: short heading, max 80 chars.",
-            "tour_recommended_body: one paragraph, max 280 chars.",
-            "No markdown, no bullet characters.",
+            "brief_paragraphs: array of EXACTLY ONE object: {\"body\": \"...\"}. No \"lead\" field. No section headers inside the text.",
+            "That single body is the entire Daily Brief: one short, flowing paragraph (4-7 sentences, max ~950 characters). Write it as a tight executive summary for today—not a list, not labeled sections. Weave in: portfolio scale (vacant/hot/follow-up counts), at-risk inventory if relevant, pipeline urgency, and tour demand signals using the metrics; end with one crisp priority if space allows.",
+            "tour_recommended_title: short heading, max 90 chars.",
+            "tour_recommended_body: one paragraph, max 360 chars, aligned with tour metrics.",
+            "No markdown, no bullet characters, no emoji, no ALL CAPS headings.",
         ],
         "metrics": metrics,
     }
@@ -102,7 +126,7 @@ def enrich_home_narrative_llm(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=14) as resp:
+        with urllib.request.urlopen(req, timeout=22) as resp:
             raw = json.loads(resp.read().decode("utf-8"))
         text = (
             raw.get("candidates", [{}])[0]
@@ -114,12 +138,18 @@ def enrich_home_narrative_llm(
         paras = parsed.get("brief_paragraphs")
         out_brief: list[dict[str, str]] = fallback_brief
         if isinstance(paras, list) and len(paras) >= 1:
-            norm: list[dict[str, str]] = []
-            for p in paras[:3]:
-                if isinstance(p, dict) and isinstance(p.get("body"), str) and p["body"].strip():
-                    norm.append({"body": p["body"].strip()[:400]})
-            if len(norm) >= 1:
-                out_brief = norm
+            parts: list[str] = []
+            for p in paras[:8]:
+                if not isinstance(p, dict):
+                    continue
+                body = p.get("body")
+                if isinstance(body, str) and body.strip():
+                    parts.append(body.strip())
+            if parts:
+                # One daily brief paragraph (merge legacy multi-block responses into a single flow).
+                combined = " ".join(parts)
+                combined = " ".join(combined.split())[:1200]
+                out_brief = [{"body": combined}]
         t_title = parsed.get("tour_recommended_title")
         t_body = parsed.get("tour_recommended_body")
         out_title = (
@@ -132,7 +162,8 @@ def enrich_home_narrative_llm(
             now,
             {"brief_paragraphs": out_brief, "tour_title": out_title, "tour_body": out_body},
         )
-        return out_brief, out_title, out_body
+        final_brief = _daily_brief_as_single_paragraph(out_brief) or fallback_brief
+        return final_brief, out_title, out_body
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
         logger.warning("Home LLM enrichment skipped: %s", e)
         return fallback_brief, fallback_tour_title, fallback_tour_body

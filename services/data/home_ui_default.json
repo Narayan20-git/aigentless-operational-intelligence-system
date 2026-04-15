@@ -40,14 +40,11 @@
   },
   "dailyAiBrief": {
     "title": "Daily AI Brief",
-    "subtitle": "What changed recently",
+    "subtitle": "Today's short summary",
     "fullBriefLinkLabel": "Read full brief",
     "fallbackParagraphs": [
       {
-        "body": "Portfolio snapshot: {vac_n} vacant units in view, {hot_n} hot leads, {followup_n} leads in the follow-up queue."
-      },
-      {
-        "body": "Prioritize repricing and outreach where vacancy days are elevated and tour volume is misaligned with applications."
+        "body": "Today's snapshot: {vac_n} vacant units in view, {hot_n} hot leads, and {followup_n} leads in the follow-up queue, with {at_risk_n} units flagged at-risk—focus repricing and tour conversion there before broad discounts. Keep the pipeline warm with timely follow-ups on hot prospects, and align marketing with tour demand signals across communities. For objections, themes, and detailed next steps, use Lesa AI."
       }
     ]
   },
@@ -60,6 +57,7 @@
         "tag": "high",
         "icon": "AlertTriangle",
         "title": "Stabilize high-risk vacant inventory",
+        "ctaPath": "/packages",
         "lines": ["{at_risk_n} units flagged at-risk in the current window."]
       },
       {
@@ -67,6 +65,7 @@
         "tag": "high",
         "icon": "Sparkles",
         "title": "Accelerate follow-ups on hot pipeline leads",
+        "ctaPath": "/users",
         "lines": ["{hot_n} leads are currently marked hot."]
       }
     ]
@@ -99,14 +98,13 @@
   },
   "tourInsights": {
     "title": "Tour Insights",
-    "subtitle": "Recent tour signal volume by property",
-    "trendValue": "Live",
-    "trendLabelTemplate": "Last {d} days",
+    "subtitleTemplate": "Last {d} days • {tour_total} tours analyzed",
+    "trendLabel": "Tour volume",
     "rowTextTemplate": "Tour-related activity in the last {d} days.",
     "tourMentionsLowThreshold": 3,
     "recommendedActionTitle": "Recommended action",
     "recommendedActionBody": "Tune tour scheduling and follow-up scripts for properties with low tour mentions.",
-    "ctaPath": "/analytics",
-    "ctaLabel": "Open insights"
+    "ctaPath": "/ai",
+    "ctaLabel": "Review all tour insights"
   }
 }
