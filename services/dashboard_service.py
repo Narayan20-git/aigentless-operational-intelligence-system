@@ -762,8 +762,10 @@ def collect_lesa_ai_digest_sync(
         until = datetime.combine(end_d, datetime.max.time(), tzinfo=UTC)
         d = max(1, (end_d - start_d).days + 1)
     else:
-        since = datetime.now(UTC) - timedelta(days=d)
-        until = datetime.now(UTC)
+        now_utc = datetime.now(UTC)
+        # Rolling window must include today and never point to future dates.
+        since = now_utc - timedelta(days=d - 1)
+        until = now_utc
     since_iso = since.isoformat()
     until_iso = until.isoformat()
 
@@ -881,10 +883,10 @@ def collect_lesa_ai_digest_sync(
     now_utc = datetime.now(UTC)
     if custom_range:
         range_label = _date_range_label(custom_range[0], custom_range[1])
-    elif d == 7:
-        range_label = _calendar_week_range_label()
     else:
-        range_label = f"Last {d} days"
+        rolling_start = now_utc.date() - timedelta(days=d - 1)
+        rolling_end = now_utc.date()
+        range_label = _date_range_label(rolling_start, rolling_end)
     return {
         "window_days": d,
         "week_range_label": range_label,
