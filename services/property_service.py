@@ -470,8 +470,14 @@ async def create_new_ai_job(property_id: str, section: str, content_type: str, t
 
 def run_generation_task(job_id: str, property_id: str, section: str, content_type: str):
     """
-    Synchronous background task that handles the AI generation flow.
-    FastAPI BackgroundTasks will execute this in a thread.
+    Synchronous background task — PREVIEW ONLY mode.
+
+    Generates content using AI and stores it in generated_content field
+    for the frontend to display as a preview.
+
+    Nothing is saved to property_faqs, property_amenities, or properties.
+    No blockers are resolved. No completeness is recalculated.
+    The user must explicitly confirm to save (handled separately).
     """
     client = get_client()
     try:
@@ -485,7 +491,7 @@ def run_generation_task(job_id: str, property_id: str, section: str, content_typ
             .select("name, description, units, year_built, amenities, address, housing_type") \
             .eq("id", property_id).single().execute().data or {}
 
-        # Get missing items from blockers
+        # Get missing items from blockers (ai_can_fix = true only)
         blockers = client.table("property_onboarding_blockers") \
             .select("message, section, type") \
             .eq("property_id", property_id) \
@@ -494,28 +500,16 @@ def run_generation_task(job_id: str, property_id: str, section: str, content_typ
 
         missing_items = [b["message"] for b in blockers]
 
-        # Get RAG context
+        # Get RAG context from other properties' published FAQs
         rag_context = _get_rag_context(client, property_id, content_type)
 
         # Build prompt
         prompt = _build_prompt(prop, content_type, missing_items, rag_context)
 
-        # Call Google Gemini
+        # Generate content via OpenAI — PREVIEW ONLY, nothing saved to DB
         generated = _call_gemini(prompt, content_type)
 
-        # Save generated content
-        _save_generated_content(client, property_id, content_type, generated)
-
-        # Resolve relevant blockers
-        _resolve_blockers(client, property_id, section)
-
-        # Recalculate completion
-        try:
-            client.rpc("recalculate_onboarding_status", {"p_property_id": property_id}).execute()
-        except Exception:
-            pass # Ignore if RPC doesn't exist
-
-        # Mark job completed
+        # Store generated preview in job record only — no other DB writes
         client.table("property_ai_content_jobs").update({
             "status":            "completed",
             "prompt_used":       prompt,
@@ -575,31 +569,40 @@ def _build_prompt(prop: dict, content_type: str, missing_items: list, rag_contex
 
 
 def _call_gemini(prompt: str, content_type: str) -> dict:
+    """
+    Generate content using OpenAI gpt-4.1-mini.
+    Named _call_gemini for backward compatibility.
+    Returns parsed JSON — never saves to DB.
+    """
     try:
-        import google.generativeai as genai
-        from google.generativeai.types import HarmCategory, HarmBlockThreshold
-        genai.configure(api_key=os.environ.get("GOOGLE_API_KEY", ""))
-        model = genai.GenerativeModel("gemini-flash-latest")
-
-        response = model.generate_content(
-            prompt,
-            safety_settings={
-                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-            },
-            generation_config=genai.GenerationConfig(
-                temperature=0.7,
-                max_output_tokens=2048,
-            )
+        from openai import OpenAI
+        client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
+        response = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a property management content specialist. "
+                        "Return ONLY valid JSON — no markdown, no explanation, no code fences."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.7,
+            max_tokens=2048,
         )
-        text = response.text.strip()
+        text = response.choices[0].message.content.strip()
+        # Strip markdown fences if model adds them anyway
         if text.startswith("```"):
             text = text.split("```")[1]
             if text.startswith("json"):
                 text = text[4:]
         return json.loads(text)
+    except json.JSONDecodeError as e:
+        return {"error": f"JSON parse error: {e}", "raw": text if "text" in dir() else ""}
     except Exception as e:
-        return {"raw_content": str(e)}
+        return {"error": str(e)}
 
 
 def _save_generated_content(client, property_id: str, content_type: str, generated: dict):
