@@ -56,9 +56,34 @@ async def _coalesced_to_thread(key: str, fn: Any, *args: Any, **kwargs: Any) -> 
 
 
 def normalize_dashboard_days(days: int) -> int:
-    if days in (7, 30, 90):
-        return days
-    return 7
+    try:
+        d = int(days)
+    except (TypeError, ValueError):
+        return 7
+    if d < 1:
+        return 7
+    # Keep broad support for custom Lesa AI windows while still preventing unbounded scans.
+    return min(d, 365)
+
+
+def _normalize_custom_date_range(
+    start_date: str | None, end_date: str | None
+) -> tuple[date, date] | None:
+    if not start_date or not end_date:
+        return None
+    try:
+        start = date.fromisoformat(str(start_date).strip()[:10])
+        end = date.fromisoformat(str(end_date).strip()[:10])
+    except ValueError:
+        return None
+    if start > end:
+        start, end = end, start
+    today = datetime.now(UTC).date()
+    if end > today:
+        end = today
+    if start > end:
+        return None
+    return start, end
 
 
 def _chunks(seq: list[Any], size: int = _IN_CHUNK):
@@ -626,7 +651,26 @@ def _feedback_objection_theme_counts(rows: list[dict[str, Any]]) -> list[dict[st
     return [{"topic": k, "mentions": int(n)} for k, n in themes.most_common(12)]
 
 
-def _fetch_feedback_rows_lesa(since_iso: str, property_id: str | None, limit: int = 320) -> list[dict[str, Any]]:
+def _objection_mentions_in_feedback(raw_feedback: Any, topic: str) -> int:
+    if not isinstance(raw_feedback, dict):
+        return 0
+    topic_n = _normalize_feedback_token(topic).lower()
+    if not topic_n:
+        return 0
+    mentions = 0
+    for x in raw_feedback.get("improvements") or []:
+        t = _normalize_feedback_token(x).lower()
+        if t == topic_n:
+            mentions += 1
+    c = str(raw_feedback.get("additionalCommentsImprovements") or "").strip()
+    if len(c) > 12 and c[:100].strip().lower() == topic.strip().lower():
+        mentions += 1
+    return mentions
+
+
+def _fetch_feedback_rows_lesa(
+    since_iso: str, property_id: str | None, limit: int = 320, until_iso: str | None = None
+) -> list[dict[str, Any]]:
     client = get_client()
     try:
         if property_id:
@@ -636,42 +680,41 @@ def _fetch_feedback_rows_lesa(since_iso: str, property_id: str | None, limit: in
                 return []
             out: list[dict[str, Any]] = []
             for batch in _chunks(fp_ids, 40):
-                r = (
+                q = (
                     client.table("feedback")
                     .select("floorplan_id,created_at,raw_feedback,type")
                     .in_("floorplan_id", batch)
                     .gte("created_at", since_iso)
-                    .order("created_at", desc=True)
-                    .limit(limit)
-                    .execute()
                 )
+                if until_iso:
+                    q = q.lte("created_at", until_iso)
+                r = q.order("created_at", desc=True).limit(limit).execute()
                 out.extend(r.data or [])
                 if len(out) >= limit:
                     break
             return out[:limit]
-        r = (
+        q = (
             client.table("feedback")
             .select("floorplan_id,created_at,raw_feedback,type")
             .gte("created_at", since_iso)
-            .order("created_at", desc=True)
-            .limit(limit)
-            .execute()
         )
+        if until_iso:
+            q = q.lte("created_at", until_iso)
+        r = q.order("created_at", desc=True).limit(limit).execute()
         return r.data or []
     except Exception:
         return []
 
 
-def _prospect_event_rollups_lesa(since_iso: str, property_id: str | None) -> tuple[int, list[tuple[str, int]]]:
+def _prospect_event_rollups_lesa(
+    since_iso: str, property_id: str | None, until_iso: str | None = None
+) -> tuple[int, list[tuple[str, int]]]:
     client = get_client()
     try:
-        er = (
-            client.table("prospect_events")
-            .select("event,property_id")
-            .gte("timestamp", since_iso)
-            .limit(400)
-            .execute()
-        )
+        q = client.table("prospect_events").select("event,property_id").gte("timestamp", since_iso)
+        if until_iso:
+            q = q.lte("timestamp", until_iso)
+        er = q.limit(400).execute()
         rows = er.data or []
     except Exception:
         return 0, []
@@ -690,7 +733,19 @@ def _calendar_week_range_label() -> str:
     return f"{mon.strftime('%b %d')}–{sun.strftime('%b %d, %Y')}"
 
 
-def collect_lesa_ai_digest_sync(property_id: str | None = None, days: int = 7) -> dict[str, Any]:
+def _date_range_label(start: date, end: date) -> str:
+    if start.year != end.year:
+        return f"{start.strftime('%b %d, %Y')}–{end.strftime('%b %d, %Y')}"
+    return f"{start.strftime('%b %d')}–{end.strftime('%b %d, %Y')}"
+
+
+def collect_lesa_ai_digest_sync(
+    property_id: str | None = None,
+    days: int = 7,
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, Any]:
     """
     Compact operational facts for Lesa AI (small JSON → fast OpenAI).
     Pulls leads, inventory, onboarding in parallel; adds feedback + funnel rollups.
@@ -700,8 +755,17 @@ def collect_lesa_ai_digest_sync(property_id: str | None = None, days: int = 7) -
     from services.live_ui_payloads import build_onboarding_payload
 
     d = normalize_dashboard_days(days)
-    since = datetime.now(UTC) - timedelta(days=d)
+    custom_range = _normalize_custom_date_range(start_date, end_date)
+    if custom_range:
+        start_d, end_d = custom_range
+        since = datetime.combine(start_d, datetime.min.time(), tzinfo=UTC)
+        until = datetime.combine(end_d, datetime.max.time(), tzinfo=UTC)
+        d = max(1, (end_d - start_d).days + 1)
+    else:
+        since = datetime.now(UTC) - timedelta(days=d)
+        until = datetime.now(UTC)
     since_iso = since.isoformat()
+    until_iso = until.isoformat()
 
     def run_l() -> dict[str, Any]:
         return _build_leads_summary_sync(property_id, d)
@@ -721,10 +785,14 @@ def collect_lesa_ai_digest_sync(property_id: str | None = None, days: int = 7) -
         onb = f_o.result()
 
     vacant = inv.get("vacantUnits") or []
-    feedback_rows = _fetch_feedback_rows_lesa(since_iso, property_id, limit=320)
+    feedback_rows = _fetch_feedback_rows_lesa(
+        since_iso, property_id, limit=320, until_iso=until_iso
+    )
     fb_summary = _feedback_summary_from_rows(feedback_rows)
     objection_themes = _feedback_objection_theme_counts(feedback_rows)
-    prospect_total, funnel_pairs = _prospect_event_rollups_lesa(since_iso, property_id)
+    prospect_total, funnel_pairs = _prospect_event_rollups_lesa(
+        since_iso, property_id, until_iso=until_iso
+    )
     funnel = [{"event_type": e, "count": n} for e, n in funnel_pairs]
 
     client = get_client()
@@ -811,9 +879,19 @@ def collect_lesa_ai_digest_sync(property_id: str | None = None, days: int = 7) -
         )
 
     now_utc = datetime.now(UTC)
+    if custom_range:
+        range_label = _date_range_label(custom_range[0], custom_range[1])
+    elif d == 7:
+        range_label = _calendar_week_range_label()
+    else:
+        range_label = f"Last {d} days"
     return {
         "window_days": d,
-        "week_range_label": _calendar_week_range_label(),
+        "week_range_label": range_label,
+        "custom_range": {
+            "start_date": since.date().isoformat(),
+            "end_date": until.date().isoformat(),
+        },
         "reference_calendar": {
             "today_date_iso": now_utc.date().isoformat(),
             "today_weekday_utc": now_utc.strftime("%A"),
@@ -1481,15 +1559,198 @@ async def get_portfolio_overview_payload(
 
 
 async def get_weekly_brief_payload(
-    property_id: str | None = None, days: int = 7, *, use_llm: bool = True
+    property_id: str | None = None,
+    days: int = 7,
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    use_llm: bool = True,
 ) -> dict[str, Any]:
     from services.live_ui_payloads import build_lesa_ai_weekly_brief
 
-    d = normalize_dashboard_days(days)
+    custom_range = _normalize_custom_date_range(start_date, end_date)
+    d = (
+        max(1, (custom_range[1] - custom_range[0]).days + 1)
+        if custom_range
+        else normalize_dashboard_days(days)
+    )
     suffix = "llm" if use_llm else "fast"
-    key = f"{_dash_cache_key('brief', property_id, d)}:{suffix}"
+    custom_suffix = (
+        f":{custom_range[0].isoformat()}:{custom_range[1].isoformat()}"
+        if custom_range
+        else ""
+    )
+    key = f"{_dash_cache_key('brief', property_id, d)}:{suffix}{custom_suffix}"
     return await _coalesced_to_thread(
-        key, build_lesa_ai_weekly_brief, property_id, d, use_llm=use_llm
+        key,
+        build_lesa_ai_weekly_brief,
+        property_id,
+        d,
+        use_llm=use_llm,
+        start_date=custom_range[0].isoformat() if custom_range else None,
+        end_date=custom_range[1].isoformat() if custom_range else None,
+    )
+
+
+def _brief_objection_detail_sync(
+    *,
+    topic: str,
+    property_id: str | None = None,
+    days: int = 7,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    custom_range = _normalize_custom_date_range(start_date, end_date)
+    d = (
+        max(1, (custom_range[1] - custom_range[0]).days + 1)
+        if custom_range
+        else normalize_dashboard_days(days)
+    )
+    if custom_range:
+        start_d, end_d = custom_range
+        since = datetime.combine(start_d, datetime.min.time(), tzinfo=UTC)
+        until = datetime.combine(end_d, datetime.max.time(), tzinfo=UTC)
+    else:
+        since = datetime.now(UTC) - timedelta(days=d)
+        until = datetime.now(UTC)
+    since_iso = since.isoformat()
+    until_iso = until.isoformat()
+
+    rows = _fetch_feedback_rows_lesa(
+        since_iso=since_iso,
+        property_id=property_id,
+        limit=1200,
+        until_iso=until_iso,
+    )
+    fp_ids = list({str(r.get("floorplan_id") or "") for r in rows if r.get("floorplan_id")})
+    client = get_client()
+
+    fp_to_property: dict[str, str] = {}
+    if fp_ids:
+        for batch in _chunks(fp_ids, 50):
+            try:
+                fr = (
+                    client.table("floorplans")
+                    .select("id,property_id")
+                    .in_("id", batch)
+                    .limit(800)
+                    .execute()
+                )
+                for r in fr.data or []:
+                    fid = str(r.get("id") or "")
+                    pid = str(r.get("property_id") or "")
+                    if fid and pid:
+                        fp_to_property[fid] = pid
+            except Exception:
+                pass
+
+    property_names: dict[str, str] = {}
+    prop_ids = list({v for v in fp_to_property.values() if v})
+    if prop_ids:
+        for batch in _chunks(prop_ids, 50):
+            try:
+                pr = (
+                    client.table("properties")
+                    .select("id,name")
+                    .in_("id", batch)
+                    .limit(800)
+                    .execute()
+                )
+                for r in pr.data or []:
+                    pid = str(r.get("id") or "")
+                    if pid:
+                        property_names[pid] = str(r.get("name") or "Property")
+            except Exception:
+                pass
+
+    fp_units: dict[str, list[str]] = defaultdict(list)
+    if fp_ids:
+        for batch in _chunks(fp_ids, 50):
+            try:
+                ur = (
+                    client.table("units")
+                    .select("unit,floorplan_id")
+                    .in_("floorplan_id", batch)
+                    .limit(2400)
+                    .execute()
+                )
+                for u in ur.data or []:
+                    fid = str(u.get("floorplan_id") or "")
+                    unit_code = str(u.get("unit") or "").strip()
+                    if fid and unit_code:
+                        fp_units[fid].append(unit_code)
+            except Exception:
+                pass
+
+    total_mentions = 0
+    property_mentions: Counter[str] = Counter()
+    unit_mentions: Counter[str] = Counter()
+
+    for row in rows:
+        m = _objection_mentions_in_feedback(row.get("raw_feedback"), topic)
+        if m <= 0:
+            continue
+        total_mentions += m
+        fid = str(row.get("floorplan_id") or "")
+        pid = fp_to_property.get(fid)
+        if pid:
+            property_mentions[pid] += m
+        for unit_code in fp_units.get(fid, [])[:20]:
+            unit_mentions[unit_code] += m
+
+    by_property = [
+        {
+            "propertyId": pid,
+            "propertyName": property_names.get(pid, "Property"),
+            "mentions": int(n),
+        }
+        for pid, n in property_mentions.most_common(20)
+    ]
+    by_unit = [
+        {
+            "unit": unit,
+            "mentions": int(n),
+        }
+        for unit, n in unit_mentions.most_common(30)
+    ]
+
+    return {
+        "topic": topic,
+        "totalMentions": int(total_mentions),
+        "windowDays": d,
+        "rangeStart": since.date().isoformat(),
+        "rangeEnd": until.date().isoformat(),
+        "byProperty": by_property,
+        "byUnit": by_unit,
+    }
+
+
+async def get_brief_objection_detail_payload(
+    *,
+    topic: str,
+    property_id: str | None = None,
+    days: int = 7,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    t = str(topic or "").strip()
+    if not t:
+        return {
+            "topic": "",
+            "totalMentions": 0,
+            "windowDays": normalize_dashboard_days(days),
+            "rangeStart": "",
+            "rangeEnd": "",
+            "byProperty": [],
+            "byUnit": [],
+        }
+    return await asyncio.to_thread(
+        _brief_objection_detail_sync,
+        topic=t,
+        property_id=property_id,
+        days=days,
+        start_date=start_date,
+        end_date=end_date,
     )
 
 

@@ -23,6 +23,14 @@ logger = logging.getLogger(__name__)
 
 _PORTFOLIO_REC_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
+
+def _brief_period_titles(days: int) -> tuple[str, str]:
+    if days >= 90:
+        return "Quarterly Operator Brief", "Top Objections This Quarter"
+    if days >= 30:
+        return "Monthly Operator Brief", "Top Objections This Month"
+    return "Weekly Operator Brief", "Top Objections This Week"
+
 def _parse_ts(value: Any) -> datetime | None:
     from services.dashboard_service import _parse_ts as _p
 
@@ -76,12 +84,12 @@ def build_navigation_payload() -> dict[str, Any]:
     return {
         "main": [
             {"to": "/", "end": True, "tooltip": "Home", "icon": "Home"},
-            {"to": "/users", "end": False, "tooltip": "Pipeline", "icon": "Users"},
-            {"to": "/packages", "end": False, "tooltip": "Inventory", "icon": "Package"},
-            {"to": "/properties", "end": False, "tooltip": "Properties", "icon": "Building2"},
-            {"to": "/analytics", "end": False, "tooltip": "Portfolio", "icon": "BarChart3"},
-            {"to": "/ai", "end": False, "tooltip": "Lesa AI", "icon": "Sparkles"},
-            {"to": "/settings", "end": False, "tooltip": "Settings", "icon": "Settings"},
+            {"to": "/users", "end": False, "tooltip": "Lead Prioritization", "icon": "Users"},
+            {"to": "/packages", "end": False, "tooltip": "Inventory Intelligence", "icon": "Package"},
+            {"to": "/properties", "end": False, "tooltip": "Property Onboarding", "icon": "Building2"},
+            {"to": "/analytics", "end": False, "tooltip": "Portfolio Overview", "icon": "BarChart3"},
+            {"to": "/ai", "end": False, "tooltip": "Lesa Ai", "icon": "Sparkles"},
+            {"to": "/settings", "end": False, "tooltip": "Integrations", "icon": "Settings"},
         ],
         "profileFooter": {"to": "/profile", "tooltip": "User profile", "icon": "User"},
     }
@@ -740,23 +748,29 @@ def build_weekly_brief(days: int = 7) -> dict[str, Any]:
         f"In the last {d} days we recorded {len(event_rows)} prospect events across tracked properties. "
         f"Top signal: {top_obj[0][0] if top_obj else 'n/a'}."
     )
+    page_title, objections_title = _brief_period_titles(d)
 
     return {
-        "page": {"title": "Weekly Operator Brief", "weekLabelPrefix": "Week of"},
-        "briefWeekLabel": week_label,
+        "page": {"title": page_title, "weekLabelPrefix": "Period"},
+        "briefWeekLabel": f"Last {d} days",
         "executiveSummary": {
             "title": "Executive Summary",
             "paragraphs": [{"body": summary_body}, {"body": "Review wins and blockers below; next actions prioritize the highest-volume event types."}],
         },
         "wins": {"title": "Biggest Wins", "items": wins},
         "blockers": {"title": "Biggest Blockers", "items": blockers_items},
-        "objections": {"title": "Top Objections This Week", "items": objections_items},
+        "objections": {"title": objections_title, "items": objections_items},
         "nextActions": {"title": "Recommended Next Actions", "items": next_actions},
     }
 
 
 def build_lesa_ai_weekly_brief(
-    property_id: str | None = None, days: int = 7, *, use_llm: bool = True
+    property_id: str | None = None,
+    days: int = 7,
+    *,
+    use_llm: bool = True,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> dict[str, Any]:
     """
     Lesa AI tab: compact DB digest (parallel fetch + feedback) → OpenAI → brief JSON.
@@ -770,12 +784,27 @@ def build_lesa_ai_weekly_brief(
     fb = fallback.setdefault("page", {})
     fb["title"] = "Weekly Operator Brief"
     fb["weekLabelPrefix"] = "Week of"
-    digest = collect_lesa_ai_digest_sync(property_id, d)
+    digest = collect_lesa_ai_digest_sync(
+        property_id,
+        d,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    page_title, objections_title = _brief_period_titles(d)
+    fb["title"] = page_title
+    fb["weekLabelPrefix"] = "Period"
+    (fallback.setdefault("objections", {}))["title"] = objections_title
     if isinstance(digest.get("week_range_label"), str) and digest["week_range_label"].strip():
         fallback["briefWeekLabel"] = digest["week_range_label"].strip()[:120]
     if not use_llm:
         return fallback
-    return enrich_lesa_ai_page(digest, fallback)
+    out = enrich_lesa_ai_page(digest, fallback)
+    out_page = out.setdefault("page", {})
+    out_page["title"] = page_title
+    out_page["weekLabelPrefix"] = "Period"
+    out_obj = out.setdefault("objections", {})
+    out_obj["title"] = objections_title
+    return out
 
 
 def build_home_payload_from_parts(
