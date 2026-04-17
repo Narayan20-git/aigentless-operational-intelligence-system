@@ -491,20 +491,34 @@ def run_generation_task(job_id: str, property_id: str, section: str, content_typ
             .select("name, description, units, year_built, amenities, address, housing_type") \
             .eq("id", property_id).single().execute().data or {}
 
-        # Get missing items from blockers (ai_can_fix = true only)
-        blockers = client.table("property_onboarding_blockers") \
-            .select("message, section, type") \
-            .eq("property_id", property_id) \
-            .eq("ai_can_fix", True) \
-            .eq("resolved", False).execute().data or []
+        # For FAQs: query property_faqs directly to find categories with empty/missing answers
+        # This gives the AI the exact missing categories instead of a vague blocker message
+        missing_faq_categories: list[str] = []
+        if content_type == "faq":
+            all_faqs = client.table("property_faqs") \
+                .select("category, answer, is_published") \
+                .eq("property_id", property_id).execute().data or []
 
-        missing_items = [b["message"] for b in blockers]
+            published_with_answer = {
+                f["category"] for f in all_faqs
+                if f.get("is_published") and f.get("answer", "").strip()
+            }
+
+            # All required FAQ categories from the checklist
+            all_required_categories = [
+                "general", "pet_policy", "parking", "utilities",
+                "maintenance", "guest", "noise", "lease", "move_in",
+            ]
+            missing_faq_categories = [
+                c for c in all_required_categories
+                if c not in published_with_answer
+            ]
 
         # Get RAG context from other properties' published FAQs
         rag_context = _get_rag_context(client, property_id, content_type)
 
-        # Build prompt
-        prompt = _build_prompt(prop, content_type, missing_items, rag_context)
+        # Build prompt with specific missing categories (not vague blocker messages)
+        prompt = _build_prompt(prop, content_type, missing_faq_categories, rag_context)
 
         # Generate content via OpenAI — PREVIEW ONLY, nothing saved to DB
         generated = _call_gemini(prompt, content_type)
@@ -553,10 +567,30 @@ def _build_prompt(prop: dict, content_type: str, missing_items: list, rag_contex
     prop_context += f"Location: {json.dumps(prop.get('address', {}))}\\n"
     prop_context += f"Amenities: {', '.join(prop.get('amenities', [])[:10])}\\n"
 
-    missing_str = "\\n".join(f"- {item}" for item in missing_items) if missing_items else "Generate comprehensive content"
-
     if content_type == "faq":
-        return f"You are a property management content specialist.\\nGenerate professional FAQ answers for a rental property.\\n\\n{prop_context}\\n\\nMissing FAQs that need to be generated:\\n{missing_str}\\n\\n{rag_context}\\n\\nGenerate clear, professional FAQ answers for each missing item.\\nReturn ONLY a valid JSON array in this exact format, no other text:\\n[\\n  {{\"question\": \"What is the pet policy?\", \"answer\": \"...\", \"category\": \"pet_policy\"}}\\n]\\n\\nCategories must be one of: general, pet_policy, parking, utilities, lease, maintenance, guest, noise, move_in, move_out\\nAnswers must be 2-4 sentences, professional, and specific to this property."
+        # missing_items is a list of specific category names e.g. ["pet_policy", "parking", "lease"]
+        category_labels = {
+            "general":     "General leasing / renters insurance",
+            "pet_policy":  "Pet policy (breeds, weight, deposit, monthly pet rent)",
+            "parking":     "Parking (assigned spaces, cost, guest parking)",
+            "utilities":   "Utility billing (what is included vs resident responsibility)",
+            "maintenance": "Maintenance request process (how to submit, response time)",
+            "guest":       "Guest policy (overnight stays, duration limits)",
+            "noise":       "Noise policy (quiet hours, rules)",
+            "lease":       "Lease renewal terms (notice period, renewal process)",
+            "move_in":     "Move-in process (scheduling, checklist, key handover)",
+        }
+
+        if missing_items:
+            category_lines = "\\n".join(
+                f'- Category "{c}": {category_labels.get(c, c)}'
+                for c in missing_items
+            )
+            missing_str = f"Generate exactly ONE FAQ entry for EACH of these {len(missing_items)} missing categories:\\n{category_lines}"
+        else:
+            missing_str = "Generate comprehensive FAQ content covering all standard categories."
+
+        return f"You are a property management content specialist.\\nGenerate professional FAQ answers for a rental property.\\n\\n{prop_context}\\n\\n{missing_str}\\n\\n{rag_context}\\n\\nReturn ONLY a valid JSON array — one object per category — in this exact format, no other text:\\n[\\n  {{\"question\": \"What is the pet policy?\", \"answer\": \"...\", \"category\": \"pet_policy\"}}\\n]\\n\\nRules:\\n- category field must exactly match the category name provided above\\n- answer must be 2-4 sentences, professional, and specific to this property\\n- do NOT generate FAQs for categories not listed above"
 
     elif content_type == "amenity_description":
         amenities = prop.get("amenities", [])
